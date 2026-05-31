@@ -4,13 +4,17 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   BarChart3,
+  Check,
   CheckCircle2,
   CircleDashed,
   CloudCog,
   Clock3,
-  Film,
+  Database,
+  FileSpreadsheet,
   LoaderCircle,
+  RefreshCw,
   ScanLine,
+  Table2,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -26,30 +30,40 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import type { PredictionResponse } from "@/lib/mock-prediction";
+import { parseCsvText } from "@/lib/csv-utils";
+import type {
+  ProgressivePoint,
+  RealtimeInferenceResponse,
+} from "@/lib/inference-contract";
+import { isRealtimeInferenceResponse } from "@/lib/inference-contract";
 
 const PIPELINE_STEPS = [
   {
-    label: "Video accepted",
-    description: "The browser has staged the upload package.",
+    label: "CSV staged",
+    description: "The browser has prepared the feature CSV payload.",
   },
   {
-    label: "Upload received",
-    description: "The Vercel route has the video payload and metadata.",
+    label: "Vercel relay",
+    description: "The Next.js route validates the CSV and forwards it to EC2.",
   },
   {
-    label: "Tracking features",
-    description: "Frame extraction and bus tracking placeholders are running.",
+    label: "Realtime script",
+    description: "EC2 runs realtime_departure_learning.py against the uploaded feature CSV.",
   },
   {
-    label: "Probability model",
-    description: "Departure buckets and ETA are being prepared.",
+    label: "JSON response",
+    description: "EC2 converts probability outputs into a web-friendly response payload.",
   },
   {
-    label: "Sector ready",
-    description: "The probability sector has finished rendering.",
+    label: "Dashboard ready",
+    description: "The app renders summary metrics, trend graph, and bucket probabilities.",
   },
 ] as const;
+
+type CsvPreview = {
+  headers: string[];
+  rows: string[][];
+};
 
 function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) {
@@ -73,29 +87,108 @@ function formatSeconds(seconds: number) {
   return `${minutes} min ${remainingSeconds} sec`;
 }
 
+function sampleProgressivePoints(points: ProgressivePoint[], maxPoints = 72) {
+  if (points.length <= maxPoints) {
+    return points;
+  }
+
+  const sampledPoints: ProgressivePoint[] = [];
+  const step = (points.length - 1) / (maxPoints - 1);
+
+  for (let index = 0; index < maxPoints; index += 1) {
+    sampledPoints.push(points[Math.round(index * step)]);
+  }
+
+  return sampledPoints.filter(
+    (point, index, source) =>
+      index === 0 || point.prefixRows !== source[index - 1].prefixRows,
+  );
+}
+
+function buildSvgLine(points: ProgressivePoint[], width: number, height: number) {
+  if (points.length === 0) {
+    return {
+      path: "",
+      markers: [] as { x: number; y: number; highlighted: boolean }[],
+      minValue: 0,
+      maxValue: 0,
+    };
+  }
+
+  const padding = { top: 18, right: 18, bottom: 20, left: 18 };
+  const values = points.map((point) => point.expectedDepartureInSec);
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const valueRange = Math.max(1, maxValue - minValue);
+  const widthRange = Math.max(1, width - padding.left - padding.right);
+  const heightRange = Math.max(1, height - padding.top - padding.bottom);
+
+  const markers = points.map((point, index) => {
+    const x =
+      padding.left +
+      (index / Math.max(1, points.length - 1)) * widthRange;
+    const y =
+      padding.top +
+      (1 - (point.expectedDepartureInSec - minValue) / valueRange) * heightRange;
+
+    return {
+      x,
+      y,
+      highlighted: point.currentGateOutEvent > 0,
+    };
+  });
+
+  const path = markers
+    .map((marker, index) =>
+      `${index === 0 ? "M" : "L"} ${marker.x.toFixed(2)} ${marker.y.toFixed(2)}`,
+    )
+    .join(" ");
+
+  return { path, markers, minValue, maxValue };
+}
+
 export function RealtimeLearningWeb() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [prediction, setPrediction] = useState<PredictionResponse | null>(null);
+  const [csvPreview, setCsvPreview] = useState<CsvPreview | null>(null);
+  const [prediction, setPrediction] = useState<RealtimeInferenceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [progressValue, setProgressValue] = useState(0);
   const [activeStep, setActiveStep] = useState(0);
 
-  const previewUrl = useMemo(() => {
+  useEffect(() => {
     if (!selectedFile) {
-      return null;
+      return undefined;
     }
 
-    return URL.createObjectURL(selectedFile);
-  }, [selectedFile]);
+    let isActive = true;
 
-  useEffect(() => {
+    void selectedFile
+      .slice(0, 24 * 1024)
+      .text()
+      .then((snippet) => {
+        if (!isActive) {
+          return;
+        }
+
+        const { headers, rows } = parseCsvText(snippet);
+        setCsvPreview({
+          headers,
+          rows: rows.slice(0, 5),
+        });
+      })
+      .catch(() => {
+        if (!isActive) {
+          return;
+        }
+
+        setCsvPreview(null);
+      });
+
     return () => {
-      if (previewUrl) {
-        URL.revokeObjectURL(previewUrl);
-      }
+      isActive = false;
     };
-  }, [previewUrl]);
+  }, [selectedFile]);
 
   const statusTone = useMemo(() => {
     if (error) {
@@ -109,6 +202,24 @@ export function RealtimeLearningWeb() {
     }
     return "outline" as const;
   }, [error, isSubmitting, prediction]);
+
+  const sampledPoints = useMemo(
+    () => sampleProgressivePoints(prediction?.progressivePoints ?? []),
+    [prediction],
+  );
+  const lineChart = useMemo(
+    () => buildSvgLine(sampledPoints, 720, 240),
+    [sampledPoints],
+  );
+  const areaPath = useMemo(() => {
+    if (lineChart.markers.length === 0) {
+      return "";
+    }
+
+    return `M 18 222 L ${lineChart.markers
+      .map((marker) => `${marker.x.toFixed(2)} ${marker.y.toFixed(2)}`)
+      .join(" L ")} L 702 222 Z`;
+  }, [lineChart.markers]);
 
   async function handleUpload() {
     if (!selectedFile) {
@@ -145,13 +256,15 @@ export function RealtimeLearningWeb() {
 
     try {
       const formData = new FormData();
-      formData.append("video", selectedFile);
+      formData.append("featureCsv", selectedFile);
 
       const response = await fetch("/api/predictions", {
         method: "POST",
         body: formData,
       });
-      const payload = (await response.json()) as PredictionResponse | { error?: string };
+      const payload = (await response.json()) as
+        | RealtimeInferenceResponse
+        | { error?: string };
 
       if (!response.ok) {
         throw new Error(
@@ -161,8 +274,8 @@ export function RealtimeLearningWeb() {
         );
       }
 
-      if (!("prediction" in payload)) {
-        throw new Error("The prediction response was missing its payload.");
+      if (!isRealtimeInferenceResponse(payload)) {
+        throw new Error("The prediction response did not match the expected contract.");
       }
 
       setPrediction(payload);
@@ -185,6 +298,7 @@ export function RealtimeLearningWeb() {
   function handleVideoSelect(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0] ?? null;
     setSelectedFile(file);
+    setCsvPreview(null);
     setPrediction(null);
     setError(null);
     setProgressValue(file ? 6 : 0);
@@ -193,6 +307,7 @@ export function RealtimeLearningWeb() {
 
   function resetSelection() {
     setSelectedFile(null);
+    setCsvPreview(null);
     setPrediction(null);
     setError(null);
     setProgressValue(0);
@@ -209,12 +324,13 @@ export function RealtimeLearningWeb() {
           </Badge>
           <div className="space-y-2">
             <h1 className="max-w-2xl break-words text-2xl font-semibold tracking-tight text-foreground sm:text-3xl md:text-4xl">
-              Upload bus video and review departure probabilities on the web.
+              Upload feature CSV and review realtime departure learning on the web.
             </h1>
             <p className="max-w-3xl break-words text-sm leading-6 text-muted-foreground md:text-base">
               This Vercel web surface mirrors the AIP BUS realtime-learning flow:
-              accept a video, stage tracking work, and render probability buckets
-              that can later come from EC2.
+              accept a bus YOLO feature CSV, relay it to EC2, and render the
+              returned progressive inference results as charts and bucket
+              probabilities.
             </p>
           </div>
         </div>
@@ -222,20 +338,20 @@ export function RealtimeLearningWeb() {
         <div className="grid min-w-0 gap-3 text-sm text-muted-foreground sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
           <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
             <div className="flex items-center gap-2 text-foreground">
-              <Film className="size-4 text-primary" />
-              Upload input
+              <FileSpreadsheet className="size-4 text-primary" />
+              Feature CSV
             </div>
             <p className="mt-2 leading-6">
-              MP4, MOV, AVI, MKV, and WebM files can be staged.
+              Upload a `*_vehicle_counts.csv` file created by bus YOLO analysis.
             </p>
           </div>
           <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
             <div className="flex items-center gap-2 text-foreground">
               <BarChart3 className="size-4 text-primary" />
-              Probability sector
+              Trend graph
             </div>
             <p className="mt-2 leading-6">
-              ETA and time-bucket probabilities update after each upload.
+              Track how expected departure changes as the CSV rows accumulate.
             </p>
           </div>
           <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
@@ -244,7 +360,7 @@ export function RealtimeLearningWeb() {
               EC2-ready hook
             </div>
             <p className="mt-2 leading-6">
-              The current route is local mock data with the API seam ready.
+              The route now forwards CSV uploads to an EC2 realtime inference API.
             </p>
           </div>
         </div>
@@ -255,58 +371,46 @@ export function RealtimeLearningWeb() {
           <CardHeader className="space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="space-y-1">
-                <CardTitle className="text-xl">Video upload</CardTitle>
+                <CardTitle className="text-xl">Feature CSV upload</CardTitle>
                 <CardDescription>
-                  Select one source video, then send it through the mock
-                  inference route that can later forward to EC2.
+                  Select a single feature CSV, then send it through the Vercel
+                  relay route to the EC2 realtime-learning API.
                 </CardDescription>
               </div>
               <Badge variant="outline" className="gap-1.5">
                 <Upload className="size-3.5" />
-                Web prototype
+                EC2 relay
               </Badge>
             </div>
           </CardHeader>
           <CardContent className="space-y-6">
             <label
-              htmlFor="video-upload"
+              htmlFor="csv-upload"
               className="flex min-h-56 cursor-pointer flex-col items-center justify-center gap-4 rounded-lg border border-dashed border-primary/35 bg-primary/6 px-6 py-8 text-center transition-colors hover:border-primary/55 hover:bg-primary/10"
             >
               <div className="rounded-full border border-primary/25 bg-background/70 p-3">
-                <Upload className="size-6 text-primary" />
+                <FileSpreadsheet className="size-6 text-primary" />
               </div>
               <div className="space-y-2">
                 <p className="text-base font-medium text-foreground">
-                  Drop the video here or click to browse
+                  Drop the feature CSV here or click to browse
                 </p>
                 <p className="text-sm leading-6 text-muted-foreground">
-                  One file per request. The current web prototype keeps the
-                  upload local and returns mock probabilities.
+                  One file per request. The ideal input is a
+                  `*_vehicle_counts.csv` generated by the AIP BUS YOLO pipeline.
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground">
                 <span className="rounded-full border border-border/80 px-2.5 py-1">
-                  .mp4
-                </span>
-                <span className="rounded-full border border-border/80 px-2.5 py-1">
-                  .mov
-                </span>
-                <span className="rounded-full border border-border/80 px-2.5 py-1">
-                  .avi
-                </span>
-                <span className="rounded-full border border-border/80 px-2.5 py-1">
-                  .mkv
-                </span>
-                <span className="rounded-full border border-border/80 px-2.5 py-1">
-                  .webm
+                  .csv
                 </span>
               </div>
             </label>
 
             <input
-              id="video-upload"
+              id="csv-upload"
               type="file"
-              accept="video/*,.mp4,.mov,.avi,.mkv,.webm"
+              accept=".csv,text/csv"
               className="hidden"
               onChange={handleVideoSelect}
             />
@@ -327,23 +431,51 @@ export function RealtimeLearningWeb() {
               <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                 <div className="text-muted-foreground">MIME type</div>
                 <div className="mt-2 truncate font-medium text-foreground">
-                  {selectedFile ? selectedFile.type || "video/mp4" : "-"}
+                  {selectedFile ? selectedFile.type || "text/csv" : "-"}
                 </div>
               </div>
             </div>
 
-            {previewUrl ? (
-              <div className="overflow-hidden rounded-lg border border-border/80 bg-background/85">
-                <video
-                  key={previewUrl}
-                  className="aspect-video w-full bg-black/55 object-contain"
-                  controls
-                  src={previewUrl}
-                />
+            {csvPreview?.headers.length ? (
+              <div className="space-y-3 overflow-hidden rounded-lg border border-border/80 bg-background/85 p-4">
+                <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                  <Table2 className="size-4 text-primary" />
+                  CSV preview
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-left text-sm">
+                    <thead>
+                      <tr className="border-b border-border/70 text-muted-foreground">
+                        {csvPreview.headers.slice(0, 6).map((header) => (
+                          <th key={header} className="px-3 py-2 font-medium">
+                            {header}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {csvPreview.rows.map((row, rowIndex) => (
+                        <tr key={`${rowIndex}-${row[0] ?? "row"}`} className="border-b border-border/40">
+                          {row.slice(0, 6).map((value, valueIndex) => (
+                            <td
+                              key={`${rowIndex}-${valueIndex}`}
+                              className="max-w-44 truncate px-3 py-2 text-muted-foreground"
+                            >
+                              {value}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  Previewing the first few rows only.
+                </div>
               </div>
             ) : (
               <div className="flex min-h-52 items-center justify-center rounded-lg border border-border/80 bg-background/65 text-sm text-muted-foreground">
-                The selected video preview appears here.
+                The selected CSV headers and sample rows appear here.
               </div>
             )}
 
@@ -352,12 +484,12 @@ export function RealtimeLearningWeb() {
                 {isSubmitting ? (
                   <>
                     <LoaderCircle className="animate-spin" />
-                    Preparing sector
+                    Sending to EC2
                   </>
                 ) : (
                   <>
                     <Upload />
-                    Upload and predict
+                    Upload and infer
                   </>
                 )}
               </Button>
@@ -372,9 +504,9 @@ export function RealtimeLearningWeb() {
             </div>
 
             <div className="rounded-lg border border-border/70 bg-muted/35 px-4 py-3 text-sm leading-6 text-muted-foreground">
-              The `POST /api/predictions` route is the handoff point for the EC2
-              inference server. Right now it validates the video and returns a
-              deterministic local probability response.
+              `POST /api/predictions` is the Vercel relay point. It accepts one
+              feature CSV file, then forwards it to the EC2 realtime-learning
+              API configured through environment variables.
             </div>
           </CardContent>
         </Card>
@@ -385,7 +517,8 @@ export function RealtimeLearningWeb() {
               <div className="space-y-1">
                 <CardTitle className="text-xl">Probability sector</CardTitle>
                 <CardDescription>
-                  Status, ETA, and bucket probabilities for the latest upload.
+                  Status, progressive trend graph, and bucket probabilities for
+                  the latest inference run.
                 </CardDescription>
               </div>
               <Badge variant={statusTone} className="gap-1.5">
@@ -459,17 +592,17 @@ export function RealtimeLearningWeb() {
 
             {prediction ? (
               <div className="space-y-6">
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Clock3 className="size-4 text-primary" />
                       Expected departure
                     </div>
                     <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
-                      {formatSeconds(prediction.prediction.expectedDepartureInSec)}
+                      {formatSeconds(prediction.summary.expectedDepartureInSec)}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      around {prediction.prediction.predictedDepartureAt}
+                      around {prediction.summary.predictedDepartureAt}
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
@@ -478,93 +611,212 @@ export function RealtimeLearningWeb() {
                       Most likely bucket
                     </div>
                     <div className="mt-3 text-2xl font-semibold tracking-tight text-foreground">
-                      {prediction.prediction.bestBucketLabel}
+                      {prediction.summary.bestBucketLabel}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
                       Source: {prediction.source}
                     </p>
                   </div>
+                  <div className="rounded-lg border border-border/70 bg-background/70 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Database className="size-4 text-primary" />
+                      Processed rows
+                    </div>
+                    <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
+                      {prediction.summary.processedRows}
+                    </div>
+                    <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                      gate-out events: {prediction.summary.gateOutEvents}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-border/70 bg-background/70 p-4">
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <RefreshCw className="size-4 text-primary" />
+                      Retrain count
+                    </div>
+                    <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
+                      {prediction.summary.retrainCount}
+                    </div>
+                    <p className="mt-2 truncate text-sm leading-6 text-muted-foreground">
+                      {prediction.summary.activeModelPath || "base model / not reported"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium text-foreground">
+                      Expected departure trend by processed rows
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      sampled {sampledPoints.length} / {prediction.progressivePoints.length} points
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-border/70 bg-background/70 p-4">
+                    <svg
+                      viewBox="0 0 720 240"
+                      className="h-60 w-full"
+                      role="img"
+                      aria-label="Expected departure trend chart"
+                    >
+                      <defs>
+                        <linearGradient id="trend-fill" x1="0" x2="0" y1="0" y2="1">
+                          <stop offset="0%" stopColor="currentColor" stopOpacity="0.22" />
+                          <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+                        </linearGradient>
+                      </defs>
+                      {areaPath ? (
+                        <path
+                          d={areaPath}
+                          fill="url(#trend-fill)"
+                          className="text-primary"
+                        />
+                      ) : null}
+                      <path
+                        d={lineChart.path}
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        className="text-primary"
+                        strokeLinejoin="round"
+                        strokeLinecap="round"
+                      />
+                      {lineChart.markers.map((marker, index) => (
+                        <circle
+                          key={`${index}-${marker.x}`}
+                          cx={marker.x}
+                          cy={marker.y}
+                          r={marker.highlighted ? 4.4 : 2.8}
+                          className={
+                            marker.highlighted
+                              ? "fill-chart-2 stroke-background"
+                              : "fill-primary/85"
+                          }
+                        />
+                      ))}
+                    </svg>
+                    <div className="mt-3 grid gap-3 text-sm text-muted-foreground sm:grid-cols-3">
+                      <div className="rounded-lg border border-border/60 bg-background/65 px-3 py-2">
+                        <div>Lower range</div>
+                        <div className="mt-1 font-medium text-foreground">
+                          {formatSeconds(Math.round(lineChart.minValue))}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-border/60 bg-background/65 px-3 py-2">
+                        <div>Upper range</div>
+                        <div className="mt-1 font-medium text-foreground">
+                          {formatSeconds(Math.round(lineChart.maxValue))}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-border/60 bg-background/65 px-3 py-2">
+                        <div>Gate-out markers</div>
+                        <div className="mt-1 flex items-center gap-2 font-medium text-foreground">
+                          <Check className="size-4 text-chart-2" />
+                          highlighted points
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-foreground">
-                    Probability by time bucket
+                    Bucket probability chart
                   </div>
-                  {prediction.prediction.buckets.map((bucket) => (
-                    <div key={bucket.label} className="space-y-2">
-                      <div className="flex items-center justify-between gap-3 text-sm">
-                        <div>
-                          <div className="font-medium text-foreground">
-                            {bucket.label}
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    {prediction.finalBuckets.map((bucket) => (
+                      <div
+                        key={bucket.label}
+                        className="rounded-lg border border-border/70 bg-background/70 p-4"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="font-medium text-foreground">{bucket.label}</div>
+                            <div className="text-xs text-muted-foreground">
+                              {bucket.etaStartLabel}
+                              {bucket.etaEndLabel ? ` - ${bucket.etaEndLabel}` : "+"}
+                            </div>
                           </div>
-                          <div className="text-muted-foreground">
-                            {bucket.etaStartLabel}
-                            {bucket.etaEndLabel ? ` - ${bucket.etaEndLabel}` : "+"}
+                          <div className="text-sm font-medium text-foreground">
+                            {bucket.probabilityPercent}%
                           </div>
                         </div>
-                        <div className="font-medium text-foreground">
-                          {bucket.probabilityPercent}%
+                        <div className="mt-4 flex h-36 items-end justify-center rounded-md border border-border/50 bg-muted/25 p-2">
+                          <div
+                            className="w-12 rounded-t-md bg-primary/85 transition-[height]"
+                            style={{
+                              height: `${Math.max(bucket.probabilityPercent, 4)}%`,
+                            }}
+                          />
                         </div>
+                        <Progress value={bucket.probabilityPercent} className="mt-3 h-2" />
                       </div>
-                      <Progress value={bucket.probabilityPercent} className="h-2" />
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
 
                 <Separator />
 
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-foreground">
-                    Tracking telemetry placeholder
+                    Inference run details
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Tracked buses inside</div>
-                      <div className="mt-2 text-xl font-semibold text-foreground">
-                        {prediction.prediction.telemetry.busCountInside}
+                      <div className="text-sm text-muted-foreground">Uploaded CSV</div>
+                      <div className="mt-2 text-base font-semibold text-foreground">
+                        {prediction.uploadedCsv.name}
+                      </div>
+                      <div className="mt-2 text-sm text-muted-foreground">
+                        {prediction.uploadedCsv.rowCount} rows / {prediction.uploadedCsv.columnCount} columns
                       </div>
                     </div>
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Total waiting time</div>
-                      <div className="mt-2 text-xl font-semibold text-foreground">
-                        {formatSeconds(
-                          prediction.prediction.telemetry.totalWaitingTimeSec,
-                        )}
+                      <div className="text-sm text-muted-foreground">Columns detected</div>
+                      <div className="mt-2 text-sm font-medium leading-6 text-foreground">
+                        {prediction.uploadedCsv.columns.slice(0, 6).join(", ")}
+                        {prediction.uploadedCsv.columns.length > 6 ? ", ..." : ""}
                       </div>
                     </div>
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Seconds since last in</div>
+                      <div className="text-sm text-muted-foreground">Best bucket confidence</div>
                       <div className="mt-2 text-xl font-semibold text-foreground">
-                        {formatSeconds(
-                          prediction.prediction.telemetry.secondsSinceLastNewBus,
-                        )}
+                        {prediction.summary.bestBucketProbabilityPercent}%
                       </div>
                     </div>
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Seconds since last out</div>
-                      <div className="mt-2 text-xl font-semibold text-foreground">
-                        {formatSeconds(
-                          prediction.prediction.telemetry.secondsSinceLastOutBus,
-                        )}
+                      <div className="text-sm text-muted-foreground">Generated at</div>
+                      <div className="mt-2 text-sm font-semibold text-foreground">
+                        {new Intl.DateTimeFormat("ko-KR", {
+                          dateStyle: "short",
+                          timeStyle: "medium",
+                        }).format(new Date(prediction.summary.generatedAt))}
                       </div>
                     </div>
                   </div>
                 </div>
 
-                <div className="rounded-lg border border-primary/20 bg-primary/8 px-4 py-3 text-sm leading-6 text-muted-foreground">
-                  {prediction.integrationNote}
-                </div>
+                {prediction.notes.length ? (
+                  <div className="rounded-lg border border-primary/20 bg-primary/8 px-4 py-3 text-sm leading-6 text-muted-foreground">
+                    <div className="font-medium text-foreground">Integration notes</div>
+                    <ul className="mt-2 space-y-1">
+                      {prediction.notes.map((note) => (
+                        <li key={note}>- {note}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="flex min-h-72 flex-col justify-center gap-3 rounded-lg border border-dashed border-border/75 bg-background/60 px-5 py-6">
                 <div className="flex items-center gap-2 text-foreground">
-                  <BarChart3 className="size-5 text-primary" />
-                  Probability sector is waiting for a video upload
+                  <FileSpreadsheet className="size-5 text-primary" />
+                  Probability sector is waiting for a feature CSV
                 </div>
                 <p className="max-w-md text-sm leading-6 text-muted-foreground">
-                  Upload one video from the left panel to see ETA, probability
-                  buckets, and placeholder telemetry based on the AIP BUS
-                  realtime-learning workflow.
+                  Upload one bus YOLO feature CSV from the left panel to see the
+                  progressive departure trend, bucket probabilities, and
+                  realtime-learning summary returned from EC2.
                 </p>
               </div>
             )}
