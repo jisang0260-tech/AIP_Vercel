@@ -46,13 +46,14 @@ Server-side variables:
 
 - `EC2_REALTIME_LEARNING_URL`
   - full EC2 API URL
-  - example: `https://your-ec2-api.example.com/inference/realtime-learning`
+  - example: `http://52.20.80.134:8000/inference/realtime-learning`
 - `EC2_INFERENCE_API_KEY`
   - shared secret sent as `x-api-key`
   - server-only variable; do not expose it in client components
 - `EC2_REQUEST_TIMEOUT_MS`
   - optional relay timeout in milliseconds
   - defaults to `180000`
+  - use a larger value such as `700000` if EC2 realtime inference is long-running
 
 If either `EC2_REALTIME_LEARNING_URL` or `EC2_INFERENCE_API_KEY` is missing,
 `POST /api/predictions` returns a clear server configuration error. The app

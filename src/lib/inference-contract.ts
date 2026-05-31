@@ -38,6 +38,9 @@ export type ProgressivePoint = {
   topBucketProbabilityPercent: number;
   currentGateOutEvent: number;
   seenGateOutEvents: number;
+  probabilityUpTo120Percent?: number;
+  probability120To300Percent?: number;
+  probabilityOver300Percent?: number;
 };
 
 export type InferenceSummary = {

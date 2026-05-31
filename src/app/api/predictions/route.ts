@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { isRealtimeInferenceResponse } from "@/lib/inference-contract";
+import { normalizeRealtimeInferenceResponse } from "@/lib/inference-normalizer";
 
 const MAX_CSV_SIZE_BYTES = 4 * 1024 * 1024;
 const CSV_FILE_PATTERN = /\.csv$/i;
@@ -35,7 +35,20 @@ function extractErrorMessage(payload: unknown, defaultMessage: string) {
 }
 
 export async function POST(request: Request) {
-  const formData = await request.formData();
+  let formData: FormData;
+
+  try {
+    formData = await request.formData();
+  } catch {
+    return NextResponse.json(
+      {
+        error:
+          "Send the uploaded CSV as multipart/form-data with the featureCsv field.",
+      },
+      { status: 400 },
+    );
+  }
+
   const featureCsv = formData.get("featureCsv");
 
   if (!(featureCsv instanceof File)) {
@@ -128,7 +141,9 @@ export async function POST(request: Request) {
       );
     }
 
-    if (!isRealtimeInferenceResponse(payload)) {
+    const normalizedPayload = normalizeRealtimeInferenceResponse(payload);
+
+    if (!normalizedPayload) {
       return NextResponse.json(
         {
           error:
@@ -138,7 +153,7 @@ export async function POST(request: Request) {
       );
     }
 
-    return NextResponse.json(payload);
+    return NextResponse.json(normalizedPayload);
   } catch (error) {
     const message =
       error instanceof Error && error.name === "AbortError"

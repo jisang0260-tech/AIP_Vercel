@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   BarChart3,
-  Check,
   CheckCircle2,
   CircleDashed,
   CloudCog,
@@ -65,6 +64,23 @@ type CsvPreview = {
   rows: string[][];
 };
 
+type ChartMarker = {
+  x: number;
+  y: number;
+  value: number;
+  highlighted: boolean;
+  point: ProgressivePoint;
+  index: number;
+};
+
+type ProbabilityBandKey =
+  | "probabilityUpTo120Percent"
+  | "probability120To300Percent"
+  | "probabilityOver300Percent";
+
+const CHART_WIDTH = 720;
+const CHART_HEIGHT = 260;
+
 function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) {
     return `${(bytes / 1024).toFixed(1)} KB`;
@@ -78,13 +94,25 @@ function formatFileSize(bytes: number) {
 }
 
 function formatSeconds(seconds: number) {
-  if (seconds < 60) {
-    return `${seconds} sec`;
+  const roundedSeconds = Math.max(0, Math.round(seconds));
+
+  if (roundedSeconds < 60) {
+    return `${roundedSeconds} sec`;
   }
 
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
+  const minutes = Math.floor(roundedSeconds / 60);
+  const remainingSeconds = roundedSeconds % 60;
   return `${minutes} min ${remainingSeconds} sec`;
+}
+
+function formatMinuteAxisLabel(seconds: number) {
+  const minutes = Math.max(0, seconds) / 60;
+
+  if (minutes >= 10) {
+    return `${Math.round(minutes)} min`;
+  }
+
+  return `${minutes.toFixed(1)} min`;
 }
 
 function sampleProgressivePoints(points: ProgressivePoint[], maxPoints = 72) {
@@ -92,49 +120,95 @@ function sampleProgressivePoints(points: ProgressivePoint[], maxPoints = 72) {
     return points;
   }
 
-  const sampledPoints: ProgressivePoint[] = [];
-  const step = (points.length - 1) / (maxPoints - 1);
+  const selectedIndexes = new Set<number>([0, points.length - 1]);
 
-  for (let index = 0; index < maxPoints; index += 1) {
-    sampledPoints.push(points[Math.round(index * step)]);
+  points.forEach((point, index) => {
+    if (point.currentGateOutEvent > 0) {
+      selectedIndexes.add(index);
+    }
+  });
+
+  const remainingIndexes = points
+    .map((_, index) => index)
+    .filter((index) => !selectedIndexes.has(index));
+  const remainingSlots = Math.max(0, maxPoints - selectedIndexes.size);
+
+  if (remainingSlots > 0 && remainingIndexes.length > 0) {
+    const step =
+      remainingSlots === 1
+        ? 0
+        : (remainingIndexes.length - 1) / (remainingSlots - 1);
+
+    for (let sampleIndex = 0; sampleIndex < remainingSlots; sampleIndex += 1) {
+      selectedIndexes.add(remainingIndexes[Math.round(sampleIndex * step)]);
+    }
   }
 
-  return sampledPoints.filter(
-    (point, index, source) =>
-      index === 0 || point.prefixRows !== source[index - 1].prefixRows,
-  );
+  return [...selectedIndexes]
+    .sort((left, right) => left - right)
+    .map((index) => points[index]);
+}
+
+function buildAreaPath(
+  markers: ChartMarker[],
+  width: number,
+  padding: { left: number; right: number },
+  baselineY: number,
+) {
+  if (markers.length === 0) {
+    return "";
+  }
+
+  return `M ${padding.left} ${baselineY} L ${markers
+    .map((marker) => `${marker.x.toFixed(2)} ${marker.y.toFixed(2)}`)
+    .join(" L ")} L ${width - padding.right} ${baselineY} Z`;
 }
 
 function buildSvgLine(points: ProgressivePoint[], width: number, height: number) {
+  const padding = { top: 18, right: 18, bottom: 34, left: 18 };
+  const plotWidth = Math.max(1, width - padding.left - padding.right);
+  const plotHeight = Math.max(1, height - padding.top - padding.bottom);
+  const baselineY = height - padding.bottom;
+
   if (points.length === 0) {
     return {
       path: "",
-      markers: [] as { x: number; y: number; highlighted: boolean }[],
+      markers: [] as ChartMarker[],
+      padding,
+      plotWidth,
+      plotHeight,
+      baselineY,
+      minTime: 0,
+      maxTime: 0,
       minValue: 0,
       maxValue: 0,
     };
   }
 
-  const padding = { top: 18, right: 18, bottom: 20, left: 18 };
+  const times = points.map((point) => point.currentTimeSecond);
   const values = points.map((point) => point.expectedDepartureInSec);
+  const minTime = Math.min(...times);
+  const maxTime = Math.max(...times);
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
+  const timeRange = Math.max(1, maxTime - minTime);
   const valueRange = Math.max(1, maxValue - minValue);
-  const widthRange = Math.max(1, width - padding.left - padding.right);
-  const heightRange = Math.max(1, height - padding.top - padding.bottom);
 
   const markers = points.map((point, index) => {
     const x =
       padding.left +
-      (index / Math.max(1, points.length - 1)) * widthRange;
+      ((point.currentTimeSecond - minTime) / timeRange) * plotWidth;
     const y =
       padding.top +
-      (1 - (point.expectedDepartureInSec - minValue) / valueRange) * heightRange;
+      (1 - (point.expectedDepartureInSec - minValue) / valueRange) * plotHeight;
 
     return {
       x,
       y,
+      value: point.expectedDepartureInSec,
       highlighted: point.currentGateOutEvent > 0,
+      point,
+      index,
     };
   });
 
@@ -144,7 +218,115 @@ function buildSvgLine(points: ProgressivePoint[], width: number, height: number)
     )
     .join(" ");
 
-  return { path, markers, minValue, maxValue };
+  return {
+    path,
+    markers,
+    padding,
+    plotWidth,
+    plotHeight,
+    baselineY,
+    minTime,
+    maxTime,
+    minValue,
+    maxValue,
+  };
+}
+
+function buildProbabilityBandLine(
+  points: ProgressivePoint[],
+  width: number,
+  height: number,
+  key: ProbabilityBandKey,
+) {
+  const availablePoints = points.filter(
+    (point): point is ProgressivePoint & Record<ProbabilityBandKey, number> =>
+      typeof point[key] === "number" && Number.isFinite(point[key]),
+  );
+  const padding = { top: 18, right: 18, bottom: 34, left: 18 };
+  const plotWidth = Math.max(1, width - padding.left - padding.right);
+  const plotHeight = Math.max(1, height - padding.top - padding.bottom);
+  const baselineY = height - padding.bottom;
+
+  if (availablePoints.length === 0) {
+    return {
+      path: "",
+      markers: [] as ChartMarker[],
+      padding,
+      plotWidth,
+      plotHeight,
+      baselineY,
+      minTime: 0,
+      maxTime: 0,
+      minValue: 0,
+      maxValue: 100,
+    };
+  }
+
+  const times = availablePoints.map((point) => point.currentTimeSecond);
+  const minTime = Math.min(...times);
+  const maxTime = Math.max(...times);
+  const timeRange = Math.max(1, maxTime - minTime);
+  const minValue = 0;
+  const maxValue = 100;
+  const valueRange = maxValue - minValue;
+
+  const markers = availablePoints.map((point, index) => {
+    const value = point[key];
+    const x =
+      padding.left +
+      ((point.currentTimeSecond - minTime) / timeRange) * plotWidth;
+    const y = padding.top + (1 - value / valueRange) * plotHeight;
+
+    return {
+      x,
+      y,
+      value,
+      highlighted: point.currentGateOutEvent > 0,
+      point,
+      index,
+    } satisfies ChartMarker;
+  });
+
+  const path = markers
+    .map((marker, index) =>
+      `${index === 0 ? "M" : "L"} ${marker.x.toFixed(2)} ${marker.y.toFixed(2)}`,
+    )
+    .join(" ");
+
+  return {
+    path,
+    markers,
+    padding,
+    plotWidth,
+    plotHeight,
+    baselineY,
+    minTime,
+    maxTime,
+    minValue,
+    maxValue,
+  };
+}
+
+function buildTimeTicks(
+  minTime: number,
+  maxTime: number,
+  width: number,
+  padding: { left: number; right: number },
+  count = 5,
+) {
+  const plotWidth = Math.max(1, width - padding.left - padding.right);
+  const timeRange = Math.max(1, maxTime - minTime);
+
+  return Array.from({ length: count }, (_, index) => {
+    const ratio = count === 1 ? 0 : index / (count - 1);
+    const x = padding.left + ratio * plotWidth;
+    const timeSecond = minTime + ratio * timeRange;
+
+    return {
+      x,
+      label: formatMinuteAxisLabel(timeSecond - minTime),
+    };
+  });
 }
 
 export function RealtimeLearningWeb() {
@@ -155,6 +337,7 @@ export function RealtimeLearningWeb() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [progressValue, setProgressValue] = useState(0);
   const [activeStep, setActiveStep] = useState(0);
+  const [hoveredPointIndex, setHoveredPointIndex] = useState<number | null>(null);
 
   useEffect(() => {
     if (!selectedFile) {
@@ -208,18 +391,93 @@ export function RealtimeLearningWeb() {
     [prediction],
   );
   const lineChart = useMemo(
-    () => buildSvgLine(sampledPoints, 720, 240),
+    () => buildSvgLine(sampledPoints, CHART_WIDTH, CHART_HEIGHT),
     [sampledPoints],
   );
+  const timeTicks = useMemo(
+    () =>
+      buildTimeTicks(
+        lineChart.minTime,
+        lineChart.maxTime,
+        CHART_WIDTH,
+        lineChart.padding,
+      ),
+    [lineChart.maxTime, lineChart.minTime, lineChart.padding],
+  );
   const areaPath = useMemo(() => {
-    if (lineChart.markers.length === 0) {
-      return "";
-    }
+    return buildAreaPath(
+      lineChart.markers,
+      CHART_WIDTH,
+      lineChart.padding,
+      lineChart.baselineY,
+    );
+  }, [lineChart.baselineY, lineChart.markers, lineChart.padding]);
+  const hoveredMarker =
+    hoveredPointIndex === null ? null : lineChart.markers[hoveredPointIndex] ?? null;
+  const hoveredPoint = hoveredMarker?.point ?? null;
+  const tooltipPosition = hoveredMarker
+    ? {
+        left: `${Math.min(92, Math.max(8, (hoveredMarker.x / CHART_WIDTH) * 100))}%`,
+        top: `${Math.min(84, Math.max(14, (hoveredMarker.y / CHART_HEIGHT) * 100))}%`,
+      }
+    : null;
+  const gateOutMarkerCount = useMemo(
+    () =>
+      (prediction?.progressivePoints ?? []).filter(
+        (point) => point.currentGateOutEvent > 0,
+      ).length,
+    [prediction],
+  );
+  const groupedProbabilityCharts = useMemo(() => {
+    const charts = [
+      {
+        key: "probabilityUpTo120Percent" as const,
+        title: "0-120 sec probability",
+        description: "0-30 + 30-60 + 60-120 sec",
+        toneClass: "text-emerald-600",
+        gradientId: "probability-band-under-120",
+      },
+      {
+        key: "probability120To300Percent" as const,
+        title: "120-300 sec probability",
+        description: "120-180 + 180-300 sec",
+        toneClass: "text-amber-600",
+        gradientId: "probability-band-120-300",
+      },
+      {
+        key: "probabilityOver300Percent" as const,
+        title: ">300 sec probability",
+        description: "300-600 + >600 sec",
+        toneClass: "text-fuchsia-600",
+        gradientId: "probability-band-over-300",
+      },
+    ];
 
-    return `M 18 222 L ${lineChart.markers
-      .map((marker) => `${marker.x.toFixed(2)} ${marker.y.toFixed(2)}`)
-      .join(" L ")} L 702 222 Z`;
-  }, [lineChart.markers]);
+    return charts.map((config) => {
+      const chart = buildProbabilityBandLine(
+        sampledPoints,
+        CHART_WIDTH,
+        220,
+        config.key,
+      );
+
+      return {
+        ...config,
+        chart,
+        areaPath: buildAreaPath(
+          chart.markers,
+          CHART_WIDTH,
+          chart.padding,
+          chart.baselineY,
+        ),
+        latestValue: chart.markers.at(-1)?.value ?? null,
+        hasData: chart.markers.length > 0,
+      };
+    });
+  }, [sampledPoints]);
+  const hasGroupedProbabilityCharts = groupedProbabilityCharts.some(
+    (chart) => chart.hasData,
+  );
 
   async function handleUpload() {
     if (!selectedFile) {
@@ -231,6 +489,7 @@ export function RealtimeLearningWeb() {
     setIsSubmitting(true);
     setProgressValue(8);
     setActiveStep(0);
+    setHoveredPointIndex(null);
 
     const intervalId = window.setInterval(() => {
       setProgressValue((current) => {
@@ -303,6 +562,7 @@ export function RealtimeLearningWeb() {
     setError(null);
     setProgressValue(file ? 6 : 0);
     setActiveStep(0);
+    setHoveredPointIndex(null);
   }
 
   function resetSelection() {
@@ -312,6 +572,7 @@ export function RealtimeLearningWeb() {
     setError(null);
     setProgressValue(0);
     setActiveStep(0);
+    setHoveredPointIndex(null);
   }
 
   return (
@@ -620,13 +881,13 @@ export function RealtimeLearningWeb() {
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Database className="size-4 text-primary" />
-                      Processed rows
+                      ROI out events
                     </div>
                     <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
-                      {prediction.summary.processedRows}
+                      {prediction.summary.gateOutEvents}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      gate-out events: {prediction.summary.gateOutEvents}
+                      blue markers on the trend graph
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
@@ -646,73 +907,129 @@ export function RealtimeLearningWeb() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-sm font-medium text-foreground">
-                      Expected departure trend by processed rows
+                      Expected departure trend by elapsed time
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      sampled {sampledPoints.length} / {prediction.progressivePoints.length} points
+                      Hover a point to inspect departure timing
                     </div>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                    <svg
-                      viewBox="0 0 720 240"
-                      className="h-60 w-full"
-                      role="img"
-                      aria-label="Expected departure trend chart"
-                    >
-                      <defs>
-                        <linearGradient id="trend-fill" x1="0" x2="0" y1="0" y2="1">
-                          <stop offset="0%" stopColor="currentColor" stopOpacity="0.22" />
-                          <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
-                        </linearGradient>
-                      </defs>
-                      {areaPath ? (
-                        <path
-                          d={areaPath}
-                          fill="url(#trend-fill)"
-                          className="text-primary"
-                        />
+                    <div className="relative">
+                      {hoveredPoint && tooltipPosition ? (
+                        <div
+                          className="pointer-events-none absolute z-10 w-52 -translate-x-1/2 -translate-y-[calc(100%+0.75rem)] rounded-lg border border-border/80 bg-popover/96 px-3 py-2 text-left shadow-lg backdrop-blur-sm"
+                          style={tooltipPosition}
+                        >
+                          <div className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
+                            Expected departure
+                          </div>
+                          <div className="mt-1 text-sm font-semibold text-foreground">
+                            {formatSeconds(hoveredPoint.expectedDepartureInSec)}
+                          </div>
+                          <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                            Current time {hoveredPoint.currentTimeLabel}
+                          </div>
+                          <div className="text-xs leading-5 text-muted-foreground">
+                            Top bucket {hoveredPoint.topBucket} ({hoveredPoint.topBucketProbabilityPercent}%)
+                          </div>
+                          {hoveredPoint.currentGateOutEvent > 0 ? (
+                            <div className="mt-2 inline-flex items-center gap-2 text-xs font-medium text-sky-600">
+                              <span className="size-2 rounded-full bg-sky-500" />
+                              ROI out detected
+                            </div>
+                          ) : null}
+                        </div>
                       ) : null}
-                      <path
-                        d={lineChart.path}
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        className="text-primary"
-                        strokeLinejoin="round"
-                        strokeLinecap="round"
-                      />
-                      {lineChart.markers.map((marker, index) => (
-                        <circle
-                          key={`${index}-${marker.x}`}
-                          cx={marker.x}
-                          cy={marker.y}
-                          r={marker.highlighted ? 4.4 : 2.8}
-                          className={
-                            marker.highlighted
-                              ? "fill-chart-2 stroke-background"
-                              : "fill-primary/85"
-                          }
+
+                      <svg
+                        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+                        className="h-64 w-full"
+                        role="img"
+                        aria-label="Expected departure trend chart"
+                      >
+                        <defs>
+                          <linearGradient id="trend-fill" x1="0" x2="0" y1="0" y2="1">
+                            <stop offset="0%" stopColor="currentColor" stopOpacity="0.22" />
+                            <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+                          </linearGradient>
+                        </defs>
+                        {timeTicks.map((tick) => (
+                          <line
+                            key={`tick-${tick.x}`}
+                            x1={tick.x}
+                            x2={tick.x}
+                            y1={lineChart.padding.top}
+                            y2={lineChart.baselineY}
+                            stroke="currentColor"
+                            strokeOpacity="0.08"
+                            strokeDasharray="4 6"
+                            className="text-foreground"
+                          />
+                        ))}
+                        <line
+                          x1={lineChart.padding.left}
+                          x2={CHART_WIDTH - lineChart.padding.right}
+                          y1={lineChart.baselineY}
+                          y2={lineChart.baselineY}
+                          stroke="currentColor"
+                          strokeOpacity="0.18"
+                          className="text-foreground"
                         />
-                      ))}
-                    </svg>
-                    <div className="mt-3 grid gap-3 text-sm text-muted-foreground sm:grid-cols-3">
-                      <div className="rounded-lg border border-border/60 bg-background/65 px-3 py-2">
-                        <div>Lower range</div>
-                        <div className="mt-1 font-medium text-foreground">
-                          {formatSeconds(Math.round(lineChart.minValue))}
-                        </div>
-                      </div>
-                      <div className="rounded-lg border border-border/60 bg-background/65 px-3 py-2">
-                        <div>Upper range</div>
-                        <div className="mt-1 font-medium text-foreground">
-                          {formatSeconds(Math.round(lineChart.maxValue))}
-                        </div>
-                      </div>
-                      <div className="rounded-lg border border-border/60 bg-background/65 px-3 py-2">
-                        <div>Gate-out markers</div>
-                        <div className="mt-1 flex items-center gap-2 font-medium text-foreground">
-                          <Check className="size-4 text-chart-2" />
-                          highlighted points
+                        {areaPath ? (
+                          <path
+                            d={areaPath}
+                            fill="url(#trend-fill)"
+                            className="text-primary"
+                          />
+                        ) : null}
+                        <path
+                          d={lineChart.path}
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="3"
+                          className="text-primary"
+                          strokeLinejoin="round"
+                          strokeLinecap="round"
+                        />
+                        {lineChart.markers.map((marker) => (
+                          <circle
+                            key={`${marker.index}-${marker.x}`}
+                            cx={marker.x}
+                            cy={marker.y}
+                            r={marker.highlighted ? 5.2 : 3.2}
+                            tabIndex={0}
+                            aria-label={`${marker.point.currentTimeLabel}, expected departure ${formatSeconds(marker.point.expectedDepartureInSec)}`}
+                            onMouseEnter={() => setHoveredPointIndex(marker.index)}
+                            onFocus={() => setHoveredPointIndex(marker.index)}
+                            onMouseLeave={() => setHoveredPointIndex(null)}
+                            onBlur={() => setHoveredPointIndex(null)}
+                            className={
+                              marker.highlighted
+                                ? "cursor-pointer fill-sky-500 stroke-background stroke-[1.5]"
+                                : "cursor-pointer fill-primary/85"
+                            }
+                          />
+                        ))}
+                      </svg>
+
+                      <div className="relative mt-4 h-12">
+                        {timeTicks.map((tick) => (
+                          <div
+                            key={tick.label + tick.x}
+                            className="absolute top-0 -translate-x-1/2 text-[11px] text-muted-foreground"
+                            style={{ left: `${(tick.x / CHART_WIDTH) * 100}%` }}
+                          >
+                            {tick.label}
+                          </div>
+                        ))}
+                        <div className="absolute bottom-0 left-0 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
+                          <span className="flex items-center gap-2">
+                            <span className="size-2 rounded-full bg-sky-500" />
+                            ROI out markers ({gateOutMarkerCount})
+                          </span>
+                          <span>
+                            Range: {formatSeconds(lineChart.minValue)} - {formatSeconds(lineChart.maxValue)}
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -721,7 +1038,159 @@ export function RealtimeLearningWeb() {
 
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-foreground">
-                    Bucket probability chart
+                    Grouped bucket probability trends
+                  </div>
+                  {hasGroupedProbabilityCharts ? (
+                    <div className="grid gap-4 xl:grid-cols-3">
+                      {groupedProbabilityCharts.map((group) => (
+                        <div
+                          key={group.key}
+                          className="rounded-lg border border-border/70 bg-background/70 p-4"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="font-medium text-foreground">{group.title}</div>
+                              <div className="text-xs text-muted-foreground">
+                                {group.description}
+                              </div>
+                            </div>
+                            <div className={`text-sm font-semibold ${group.toneClass}`}>
+                              {group.latestValue === null
+                                ? "-"
+                                : `${group.latestValue.toFixed(1)}%`}
+                            </div>
+                          </div>
+
+                          {group.hasData ? (
+                            <>
+                              <div className="mt-4">
+                                <svg
+                                  viewBox={`0 0 ${CHART_WIDTH} 220`}
+                                  className="h-48 w-full"
+                                  role="img"
+                                  aria-label={`${group.title} chart`}
+                                >
+                                  <defs>
+                                    <linearGradient
+                                      id={group.gradientId}
+                                      x1="0"
+                                      x2="0"
+                                      y1="0"
+                                      y2="1"
+                                    >
+                                      <stop
+                                        offset="0%"
+                                        stopColor="currentColor"
+                                        stopOpacity="0.18"
+                                      />
+                                      <stop
+                                        offset="100%"
+                                        stopColor="currentColor"
+                                        stopOpacity="0"
+                                      />
+                                    </linearGradient>
+                                  </defs>
+                                  {timeTicks.map((tick) => (
+                                    <line
+                                      key={`${group.key}-${tick.x}`}
+                                      x1={tick.x}
+                                      x2={tick.x}
+                                      y1={group.chart.padding.top}
+                                      y2={group.chart.baselineY}
+                                      stroke="currentColor"
+                                      strokeOpacity="0.08"
+                                      strokeDasharray="4 6"
+                                      className="text-foreground"
+                                    />
+                                  ))}
+                                  <line
+                                    x1={group.chart.padding.left}
+                                    x2={CHART_WIDTH - group.chart.padding.right}
+                                    y1={group.chart.baselineY}
+                                    y2={group.chart.baselineY}
+                                    stroke="currentColor"
+                                    strokeOpacity="0.18"
+                                    className="text-foreground"
+                                  />
+                                  {group.areaPath ? (
+                                    <path
+                                      d={group.areaPath}
+                                      fill={`url(#${group.gradientId})`}
+                                      className={group.toneClass}
+                                    />
+                                  ) : null}
+                                  <path
+                                    d={group.chart.path}
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="3"
+                                    className={group.toneClass}
+                                    strokeLinejoin="round"
+                                    strokeLinecap="round"
+                                  />
+                                  {group.chart.markers.map((marker) => (
+                                    <circle
+                                      key={`${group.key}-${marker.index}-${marker.x}`}
+                                      cx={marker.x}
+                                      cy={marker.y}
+                                      r={marker.highlighted ? 5.2 : 3.1}
+                                      className={
+                                        marker.highlighted
+                                          ? "fill-sky-500 stroke-background stroke-[1.5]"
+                                          : `${group.toneClass} fill-current`
+                                      }
+                                    >
+                                      <title>
+                                        {`${marker.point.currentTimeLabel} - ${group.title}: ${marker.value.toFixed(2)}%${
+                                          marker.highlighted ? " - ROI out" : ""
+                                        }`}
+                                      </title>
+                                    </circle>
+                                  ))}
+                                </svg>
+                              </div>
+                              <div className="relative mt-4 h-12">
+                                {timeTicks.map((tick) => (
+                                  <div
+                                    key={`${group.key}-${tick.label}-${tick.x}`}
+                                    className="absolute top-0 -translate-x-1/2 text-[11px] text-muted-foreground"
+                                    style={{ left: `${(tick.x / CHART_WIDTH) * 100}%` }}
+                                  >
+                                    {tick.label}
+                                  </div>
+                                ))}
+                                <div className="absolute bottom-0 left-0 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
+                                  <span className="flex items-center gap-2">
+                                    <span className="size-2 rounded-full bg-sky-500" />
+                                    ROI out markers
+                                  </span>
+                                  <span>0% - 100% probability scale</span>
+                                </div>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="mt-4 rounded-lg border border-dashed border-border/70 bg-muted/25 px-4 py-5 text-sm leading-6 text-muted-foreground">
+                              EC2 has not returned per-row bucket probabilities
+                              for this grouped series yet.
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-dashed border-border/70 bg-background/60 px-4 py-5 text-sm leading-6 text-muted-foreground">
+                      Current EC2 JSON includes the final bucket snapshot, but it
+                      does not yet expose per-row `prob_*` bucket probabilities.
+                      Once the backend returns those progressive fields, the
+                      grouped probability trends for `0-120`, `120-300`, and
+                      `over 300 sec` will render here automatically.
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-3">
+                  <div className="text-sm font-medium text-foreground">
+                    Final bucket snapshot
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     {prediction.finalBuckets.map((bucket) => (
