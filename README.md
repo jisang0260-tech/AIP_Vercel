@@ -1,50 +1,55 @@
 # AIP BUS Realtime Learning Web
 
-Vercel/Next.js based web frontend for the AIP BUS realtime-learning workflow.
+Vercel/Next.js web frontend for the AIP BUS realtime-learning workflow.
 
-This repository was created as a separate web project while using the
-`realtime-learning` branch in the `AIP BUS` repository as the reference for the
-prediction shape and UI direction.
+This repository is the web layer. It accepts a bus YOLO feature CSV upload,
+relays that CSV to an EC2 inference API, and visualizes the returned realtime
+learning result with charts and bucket probabilities.
 
-The current goal of this repo is:
+## Current Architecture
 
-- let a user upload a bus video in the browser
-- show a probability sector for the next departure window
-- keep the web layer ready for later EC2 inference integration
+Current request flow:
 
-## Current Status
+1. user uploads a `*_vehicle_counts.csv` file in the browser
+2. Next.js route `POST /api/predictions` validates the file
+3. the route forwards the CSV to the EC2 inference endpoint
+4. EC2 runs `realtime_departure_learning.py`
+5. EC2 returns a JSON payload
+6. the web app renders:
+   - summary cards
+   - expected departure trend graph
+   - bucket probability chart
+   - inference details
 
-As of May 30, 2026, the web prototype includes:
+If `EC2_REALTIME_LEARNING_URL` is not configured, the app falls back to a local
+mock response so the UI can still be tested.
 
-- video upload UI
-- local video preview
-- progress/status pipeline UI
-- probability bucket sector UI
-- mock prediction API route at `POST /api/predictions`
-- deterministic local mock response shaped for later EC2 replacement
+## Input File
 
-What is not done yet:
+Expected upload input:
 
-- no real EC2 upload
-- no polling/webhook flow for long-running inference
-- no persistent job history or saved results
-- no authentication
+- bus YOLO feature CSV
+- typical file name: `*_vehicle_counts.csv`
+- expected source: AIP BUS outputs
 
-## Reference From AIP BUS
+The CSV should come from the AIP BUS pipeline, not from manual spreadsheet
+editing.
 
-This web project was designed around the output style used in the `AIP BUS`
-`realtime-learning` work:
+## Environment Variables
 
-- time-bucket probabilities such as `0-30 sec`, `30-60 sec`, `60-120 sec`
-- expected departure ETA
-- telemetry-style fields such as:
-  - `busCountInside`
-  - `totalWaitingTimeSec`
-  - `secondsSinceLastNewBus`
-  - `secondsSinceLastOutBus`
+Create `.env.local` for local development.
 
-The current mock implementation lives in
-[`src/lib/mock-prediction.ts`](./src/lib/mock-prediction.ts).
+Example values are in [`.env.example`](./.env.example).
+
+Server-side variables:
+
+- `EC2_REALTIME_LEARNING_URL`
+  - full EC2 API URL
+  - example: `http://YOUR_EC2_PUBLIC_IP:8000/inference/realtime-learning`
+- `EC2_INFERENCE_API_KEY`
+  - optional shared secret sent as `x-api-key`
+- `EC2_REQUEST_TIMEOUT_MS`
+  - optional relay timeout in milliseconds
 
 ## Run Locally
 
@@ -54,7 +59,7 @@ Install dependencies:
 npm install
 ```
 
-Start the development server:
+Start the dev server:
 
 ```bash
 npm run dev
@@ -66,7 +71,7 @@ Open:
 http://localhost:3000
 ```
 
-Useful checks:
+Checks:
 
 ```bash
 npm run lint
@@ -75,66 +80,92 @@ npm run build
 
 ## Main Files
 
-- [`src/app/page.tsx`](./src/app/page.tsx)
-  - app entry page
 - [`src/components/realtime-learning-web.tsx`](./src/components/realtime-learning-web.tsx)
-  - main upload screen and probability sector UI
+  - main CSV upload screen and chart dashboard
 - [`src/app/api/predictions/route.ts`](./src/app/api/predictions/route.ts)
-  - temporary backend route for upload validation and mock inference response
-- [`src/lib/mock-prediction.ts`](./src/lib/mock-prediction.ts)
-  - mock probability generator and response types
+  - Vercel relay route for forwarding CSV uploads to EC2
+- [`src/lib/inference-contract.ts`](./src/lib/inference-contract.ts)
+  - shared JSON contract expected from EC2
+- [`src/lib/mock-realtime-inference.ts`](./src/lib/mock-realtime-inference.ts)
+  - local fallback response generator
+- [`src/lib/csv-utils.ts`](./src/lib/csv-utils.ts)
+  - CSV parsing helpers used by preview and fallback logic
 
-## Current API Behavior
+## EC2 JSON Contract
 
-`POST /api/predictions`
+The web expects EC2 to return a JSON payload shaped like this:
 
-Request:
+```ts
+type RealtimeInferenceResponse = {
+  requestId: string;
+  status: "completed";
+  source: string;
+  uploadedCsv: {
+    name: string;
+    sizeBytes: number;
+    mimeType: string;
+    rowCount: number;
+    columnCount: number;
+    columns: string[];
+  };
+  summary: {
+    method: string;
+    bestBucketLabel: string;
+    bestBucketProbabilityPercent: number;
+    expectedDepartureInSec: number;
+    predictedDepartureAt: string;
+    processedRows: number;
+    gateOutEvents: number;
+    retrainCount: number;
+    activeModelPath: string | null;
+    generatedAt: string;
+  };
+  finalBuckets: Array<{
+    label: string;
+    startSec: number;
+    endSec: number | null;
+    probability: number;
+    probabilityPercent: number;
+    etaStartLabel: string;
+    etaEndLabel: string | null;
+  }>;
+  progressivePoints: Array<{
+    prefixRows: number;
+    currentRowIndex: number;
+    currentTimeSecond: number;
+    currentTimeLabel: string;
+    expectedDepartureInSec: number;
+    predictedDepartureAt: string;
+    topBucket: string;
+    topBucketProbabilityPercent: number;
+    currentGateOutEvent: number;
+    seenGateOutEvents: number;
+  }>;
+  notes: string[];
+};
+```
 
-- `multipart/form-data`
-- file field name: `video`
+The easiest EC2 implementation is:
 
-Validation:
+1. receive uploaded CSV
+2. save it to a temp path
+3. run `realtime_departure_learning.py --csv <temp file>`
+4. read:
+   - `*_realtime_probability.csv`
+   - `*_realtime_progressive.csv`
+5. convert both outputs into the JSON contract above
+6. return JSON to the Vercel app
 
-- accepts common video types such as `mp4`, `mov`, `avi`, `mkv`, `webm`
-- rejects empty files
-- rejects files larger than 1 GB
+## Important Limit
 
-Current response behavior:
+When deployed on Vercel, the relay route is still subject to Vercel Function
+request size limits.
 
-- waits briefly to simulate processing
-- returns a deterministic mock prediction payload based on file metadata
-- includes:
-  - request id
-  - uploaded file metadata
-  - expected departure seconds
-  - probability buckets
-  - telemetry placeholders
+That means:
 
-## Next Recommended Work
+- small and medium feature CSV files are fine
+- very large CSV files should eventually use direct browser-to-EC2 upload or an
+  object-storage upload flow
 
-Recommended next steps for continuing this project on another PC:
-
-1. Deploy this repository to Vercel and confirm the production URL.
-2. Replace the mock implementation in
-   [`src/app/api/predictions/route.ts`](./src/app/api/predictions/route.ts)
-   with a real EC2 request.
-3. Decide on the EC2 interaction model:
-   - synchronous request/response
-   - upload + job id + polling
-   - upload + callback/webhook
-4. Keep the response contract compatible with the existing UI so the frontend
-   does not need a large rewrite.
-5. Add loading/error states for real network latency and failed inference jobs.
-
-## Notes For Handoff
-
-If you continue this from another machine such as a PC bang:
-
-1. clone the repo
-2. run `npm install`
-3. run `npm run dev`
-4. continue from the EC2 integration point above
-
-The repository is already in a workable state for frontend continuation. The
-main missing context used to be the project intent, so this README is meant to
-be the handoff summary for the next session.
+Right now the app keeps the relay route because it matches the current prototype
+goal and keeps the frontend architecture simple.
