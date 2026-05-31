@@ -21,9 +21,6 @@ Current request flow:
    - bucket probability chart
    - inference details
 
-If `EC2_REALTIME_LEARNING_URL` is not configured, the app falls back to a local
-mock response so the UI can still be tested.
-
 ## Input File
 
 Expected upload input:
@@ -37,19 +34,29 @@ editing.
 
 ## Environment Variables
 
-Create `.env.local` for local development.
+Create `.env.local` only for local development.
 
 Example values are in [`.env.example`](./.env.example).
+
+For Vercel Preview and Production deployments, set the same variables in the
+Vercel Dashboard under Project Settings -> Environment Variables. Do not rely
+on `.env.local` in production.
 
 Server-side variables:
 
 - `EC2_REALTIME_LEARNING_URL`
   - full EC2 API URL
-  - example: `http://YOUR_EC2_PUBLIC_IP:8000/inference/realtime-learning`
+  - example: `https://your-ec2-api.example.com/inference/realtime-learning`
 - `EC2_INFERENCE_API_KEY`
-  - optional shared secret sent as `x-api-key`
+  - shared secret sent as `x-api-key`
+  - server-only variable; do not expose it in client components
 - `EC2_REQUEST_TIMEOUT_MS`
   - optional relay timeout in milliseconds
+  - defaults to `180000`
+
+If either `EC2_REALTIME_LEARNING_URL` or `EC2_INFERENCE_API_KEY` is missing,
+`POST /api/predictions` returns a clear server configuration error. The app
+does not fall back to localhost, mock inference, or any local machine URL.
 
 ## Run Locally
 
@@ -65,11 +72,7 @@ Start the dev server:
 npm run dev
 ```
 
-Open:
-
-```text
-http://localhost:3000
-```
+Open the local URL printed by `npm run dev`.
 
 Checks:
 
@@ -86,10 +89,8 @@ npm run build
   - Vercel relay route for forwarding CSV uploads to EC2
 - [`src/lib/inference-contract.ts`](./src/lib/inference-contract.ts)
   - shared JSON contract expected from EC2
-- [`src/lib/mock-realtime-inference.ts`](./src/lib/mock-realtime-inference.ts)
-  - local fallback response generator
 - [`src/lib/csv-utils.ts`](./src/lib/csv-utils.ts)
-  - CSV parsing helpers used by preview and fallback logic
+  - CSV parsing helpers used by upload preview logic
 
 ## EC2 JSON Contract
 
@@ -169,3 +170,15 @@ That means:
 
 Right now the app keeps the relay route because it matches the current prototype
 goal and keeps the frontend architecture simple.
+
+## Deployment Flow
+
+In Vercel production, the intended request path is:
+
+1. user uploads a feature CSV on the deployed Vercel URL
+2. browser sends the file to `POST /api/predictions`
+3. the Next.js server route reads `EC2_REALTIME_LEARNING_URL`,
+   `EC2_INFERENCE_API_KEY`, and `EC2_REQUEST_TIMEOUT_MS`
+4. the server route forwards the CSV to the EC2 FastAPI endpoint
+5. EC2 returns JSON
+6. the Vercel app renders charts and bucket probabilities from that response

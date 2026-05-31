@@ -1,20 +1,24 @@
 import { NextResponse } from "next/server";
 
 import { isRealtimeInferenceResponse } from "@/lib/inference-contract";
-import { createMockRealtimeInferenceResponse } from "@/lib/mock-realtime-inference";
 
 const MAX_CSV_SIZE_BYTES = 4 * 1024 * 1024;
 const CSV_FILE_PATTERN = /\.csv$/i;
-const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_TIMEOUT_MS = 180_000;
 
 export const runtime = "nodejs";
+
+function getRequiredServerEnv(name: string) {
+  const value = process.env[name]?.trim();
+  return value ? value : null;
+}
 
 function getTimeoutMs() {
   const value = Number(process.env.EC2_REQUEST_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
   return Number.isFinite(value) && value > 0 ? value : DEFAULT_TIMEOUT_MS;
 }
 
-function extractErrorMessage(payload: unknown, fallback: string) {
+function extractErrorMessage(payload: unknown, defaultMessage: string) {
   if (payload && typeof payload === "object") {
     const candidate = payload as Record<string, unknown>;
 
@@ -27,7 +31,7 @@ function extractErrorMessage(payload: unknown, fallback: string) {
     }
   }
 
-  return fallback;
+  return defaultMessage;
 }
 
 export async function POST(request: Request) {
@@ -65,27 +69,33 @@ export async function POST(request: Request) {
     );
   }
 
-  const ec2Endpoint = process.env.EC2_REALTIME_LEARNING_URL;
+  const ec2Endpoint = getRequiredServerEnv("EC2_REALTIME_LEARNING_URL");
   if (!ec2Endpoint) {
-    const text = await featureCsv.text();
-    const fallbackResponse = createMockRealtimeInferenceResponse({
-      name: featureCsv.name,
-      sizeBytes: featureCsv.size,
-      mimeType: featureCsv.type || "text/csv",
-      text,
-    });
-
-    return NextResponse.json(fallbackResponse);
+    return NextResponse.json(
+      {
+        error:
+          "Server configuration error: EC2_REALTIME_LEARNING_URL is not set. Configure it in your Vercel environment variables before uploading CSV files.",
+      },
+      { status: 500 },
+    );
   }
 
   const upstreamFormData = new FormData();
   upstreamFormData.append("feature_csv", featureCsv, featureCsv.name);
 
   const headers = new Headers();
-  const apiKey = process.env.EC2_INFERENCE_API_KEY;
-  if (apiKey) {
-    headers.set("x-api-key", apiKey);
+  const apiKey = getRequiredServerEnv("EC2_INFERENCE_API_KEY");
+  if (!apiKey) {
+    return NextResponse.json(
+      {
+        error:
+          "Server configuration error: EC2_INFERENCE_API_KEY is not set. Configure it in your Vercel environment variables before uploading CSV files.",
+      },
+      { status: 500 },
+    );
   }
+
+  headers.set("x-api-key", apiKey);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {

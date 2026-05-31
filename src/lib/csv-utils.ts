@@ -71,9 +71,9 @@ export function numericValueByHeader(
   headers: string[],
   row: string[] | undefined,
   headerName: string,
-  fallback = 0,
+  defaultValue = 0,
 ) {
   const rawValue = valueByHeader(headers, row, headerName);
   const value = Number(rawValue);
-  return Number.isFinite(value) ? value : fallback;
+  return Number.isFinite(value) ? value : defaultValue;
 }
