@@ -160,7 +160,11 @@ function buildAreaPath(
     .join(" L ")} L ${width - padding.right} ${baselineY} Z`;
 }
 
-function buildSvgLine(points: ProgressivePoint[], width: number, height: number) {
+function buildSvgLine(
+  points: ProgressivePoint[],
+  width: number,
+  height: number,
+) {
   const padding = { top: 18, right: 18, bottom: 34, left: 18 };
   const plotWidth = Math.max(1, width - padding.left - padding.right);
   const plotHeight = Math.max(1, height - padding.top - padding.bottom);
@@ -181,19 +185,18 @@ function buildSvgLine(points: ProgressivePoint[], width: number, height: number)
     };
   }
 
-  const times = points.map((point) => point.currentTimeSecond);
   const values = points.map((point) => point.expectedDepartureInSec);
-  const minTime = Math.min(...times);
-  const maxTime = Math.max(...times);
+  const minTime = Math.min(...points.map((point) => point.currentTimeSecond));
+  const maxTime = Math.max(...points.map((point) => point.currentTimeSecond));
   const minValue = Math.min(...values);
   const maxValue = Math.max(...values);
-  const timeRange = Math.max(1, maxTime - minTime);
   const valueRange = Math.max(1, maxValue - minValue);
+  const pointRange = Math.max(1, points.length - 1);
 
   const markers = points.map((point, index) => {
     const x =
       padding.left +
-      ((point.currentTimeSecond - minTime) / timeRange) * plotWidth;
+      (index / pointRange) * plotWidth;
     const y =
       padding.top +
       (1 - (point.expectedDepartureInSec - minValue) / valueRange) * plotHeight;
@@ -258,19 +261,18 @@ function buildProbabilityBandLine(
     };
   }
 
-  const times = availablePoints.map((point) => point.currentTimeSecond);
-  const minTime = Math.min(...times);
-  const maxTime = Math.max(...times);
-  const timeRange = Math.max(1, maxTime - minTime);
+  const minTime = Math.min(...availablePoints.map((point) => point.currentTimeSecond));
+  const maxTime = Math.max(...availablePoints.map((point) => point.currentTimeSecond));
   const minValue = 0;
   const maxValue = 100;
   const valueRange = maxValue - minValue;
+  const pointRange = Math.max(1, availablePoints.length - 1);
 
   const markers = availablePoints.map((point, index) => {
     const value = point[key];
     const x =
       padding.left +
-      ((point.currentTimeSecond - minTime) / timeRange) * plotWidth;
+      (index / pointRange) * plotWidth;
     const y = padding.top + (1 - value / valueRange) * plotHeight;
 
     return {
@@ -325,6 +327,21 @@ function buildTimeTicks(
   });
 }
 
+function resolveTimeDomain(points: ProgressivePoint[]) {
+  if (points.length === 0) {
+    return {
+      minTime: 0,
+      maxTime: 0,
+    };
+  }
+
+  const times = points.map((point) => point.currentTimeSecond);
+  return {
+    minTime: Math.min(...times),
+    maxTime: Math.max(...times),
+  };
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
@@ -373,6 +390,10 @@ export function RealtimeLearningWeb() {
     () => sampleProgressivePoints(prediction?.progressivePoints ?? []),
     [prediction],
   );
+  const chartTimeDomain = useMemo(
+    () => resolveTimeDomain(prediction?.progressivePoints ?? []),
+    [prediction],
+  );
   const lineChart = useMemo(
     () => buildSvgLine(sampledPoints, CHART_WIDTH, CHART_HEIGHT),
     [sampledPoints],
@@ -380,12 +401,12 @@ export function RealtimeLearningWeb() {
   const timeTicks = useMemo(
     () =>
       buildTimeTicks(
-        lineChart.minTime,
-        lineChart.maxTime,
+        chartTimeDomain.minTime,
+        chartTimeDomain.maxTime,
         CHART_WIDTH,
         lineChart.padding,
       ),
-    [lineChart.maxTime, lineChart.minTime, lineChart.padding],
+    [chartTimeDomain.maxTime, chartTimeDomain.minTime, lineChart.padding],
   );
   const areaPath = useMemo(() => {
     return buildAreaPath(
@@ -951,6 +972,7 @@ export function RealtimeLearningWeb() {
 
                       <svg
                         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
+                        preserveAspectRatio="none"
                         className="h-64 w-full"
                         role="img"
                         aria-label="시간 흐름별 예상 출발 추세 그래프"
@@ -1074,6 +1096,7 @@ export function RealtimeLearningWeb() {
                               <div className="mt-4">
                                 <svg
                                   viewBox={`0 0 ${CHART_WIDTH} ${PROBABILITY_CHART_HEIGHT}`}
+                                  preserveAspectRatio="none"
                                   className="h-56 w-full"
                                   role="img"
                                   aria-label={`${group.title} chart`}
