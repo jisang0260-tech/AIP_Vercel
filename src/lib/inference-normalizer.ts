@@ -290,6 +290,31 @@ function normalizeProgressivePoints(value: unknown): ProgressivePoint[] | null {
         readNumber(record, "currentGateOutEvent", "current_gate_out_event") ?? 0;
       const seenGateOutEvents =
         readNumber(record, "seenGateOutEvents", "seen_gate_out_events") ?? 0;
+      const actualDepartureTimeSecond = readNumber(
+        record,
+        "actualDepartureTimeSecond",
+        "actual_departure_time_second",
+      );
+      const actualTimeUntilDepartureSec = readNumber(
+        record,
+        "actualTimeUntilDepartureSec",
+        "actual_time_until_departure_sec",
+      );
+      const predictionErrorSec = readNumber(
+        record,
+        "predictionErrorSec",
+        "prediction_error_sec",
+      );
+      const absoluteErrorSec = readNumber(
+        record,
+        "absoluteErrorSec",
+        "absolute_error_sec",
+      );
+      const errorEvaluatedGateOutIndex = readNumber(
+        record,
+        "errorEvaluatedGateOutIndex",
+        "error_evaluated_gate_out_index",
+      );
       const prob0To30 = readNumber(record, "prob_0_30_sec", "probability_0_30_sec");
       const prob30To60 = readNumber(record, "prob_30_60_sec", "probability_30_60_sec");
       const prob60To120 = readNumber(record, "prob_60_120_sec", "probability_60_120_sec");
@@ -365,6 +390,17 @@ function normalizeProgressivePoints(value: unknown): ProgressivePoint[] | null {
         topBucketProbabilityPercent,
         currentGateOutEvent,
         seenGateOutEvents,
+        ...(actualDepartureTimeSecond !== null
+          ? { actualDepartureTimeSecond }
+          : {}),
+        ...(actualTimeUntilDepartureSec !== null
+          ? { actualTimeUntilDepartureSec }
+          : {}),
+        ...(predictionErrorSec !== null ? { predictionErrorSec } : {}),
+        ...(absoluteErrorSec !== null ? { absoluteErrorSec } : {}),
+        ...(errorEvaluatedGateOutIndex !== null
+          ? { errorEvaluatedGateOutIndex }
+          : {}),
         ...(probabilityUpTo120Percent !== null
           ? { probabilityUpTo120Percent }
           : {}),

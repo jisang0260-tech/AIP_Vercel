@@ -38,6 +38,11 @@ export type ProgressivePoint = {
   topBucketProbabilityPercent: number;
   currentGateOutEvent: number;
   seenGateOutEvents: number;
+  actualDepartureTimeSecond?: number;
+  actualTimeUntilDepartureSec?: number;
+  predictionErrorSec?: number;
+  absoluteErrorSec?: number;
+  errorEvaluatedGateOutIndex?: number;
   probabilityUpTo120Percent?: number;
   probability120To300Percent?: number;
   probabilityOver300Percent?: number;
