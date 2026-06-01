@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   Activity,
   BarChart3,
@@ -13,7 +13,6 @@ import {
   LoaderCircle,
   RefreshCw,
   ScanLine,
-  Table2,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -29,7 +28,6 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { parseCsvText } from "@/lib/csv-utils";
 import type {
   ProgressivePoint,
   RealtimeInferenceResponse,
@@ -38,31 +36,26 @@ import { isRealtimeInferenceResponse } from "@/lib/inference-contract";
 
 const PIPELINE_STEPS = [
   {
-    label: "CSV staged",
-    description: "The browser has prepared the feature CSV payload.",
+    label: "CSV 준비",
+    description: "브라우저가 feature CSV 업로드를 준비합니다.",
   },
   {
-    label: "Vercel relay",
-    description: "The Next.js route validates the CSV and forwards it to EC2.",
+    label: "Vercel 전달",
+    description: "Next.js API route가 CSV를 검증하고 EC2로 넘깁니다.",
   },
   {
-    label: "Realtime script",
-    description: "EC2 runs realtime_departure_learning.py against the uploaded feature CSV.",
+    label: "실시간 추론",
+    description: "EC2가 realtime_departure_learning.py를 실행합니다.",
   },
   {
-    label: "JSON response",
-    description: "EC2 converts probability outputs into a web-friendly response payload.",
+    label: "진행 데이터 수신",
+    description: "진행 중 생성되는 예측 포인트를 계속 받아옵니다.",
   },
   {
-    label: "Dashboard ready",
-    description: "The app renders summary metrics, trend graph, and bucket probabilities.",
+    label: "그래프 완료",
+    description: "최종 버킷 확률과 추세 그래프를 표시합니다.",
   },
 ] as const;
-
-type CsvPreview = {
-  headers: string[];
-  rows: string[][];
-};
 
 type ChartMarker = {
   x: number;
@@ -79,7 +72,10 @@ type ProbabilityBandKey =
   | "probabilityOver300Percent";
 
 const CHART_WIDTH = 720;
-const CHART_HEIGHT = 260;
+const CHART_HEIGHT = 360;
+const PROBABILITY_CHART_HEIGHT = 260;
+const POLL_INTERVAL_MS = 1000;
+const MAX_POLL_FAILURES = 5;
 
 function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) {
@@ -329,62 +325,49 @@ function buildTimeTicks(
   });
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function getRunProgress(payload: RealtimeInferenceResponse) {
+  const totalRows = Math.max(1, payload.uploadedCsv.rowCount);
+  const processedRows = Math.max(0, payload.summary.processedRows);
+  const ratio = Math.min(1, processedRows / totalRows);
+
+  if (payload.status === "completed") {
+    return 100;
+  }
+
+  return Math.min(96, Math.max(10, 10 + ratio * 86));
+}
+
 export function RealtimeLearningWeb() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [csvPreview, setCsvPreview] = useState<CsvPreview | null>(null);
   const [prediction, setPrediction] = useState<RealtimeInferenceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pollNotice, setPollNotice] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [progressValue, setProgressValue] = useState(0);
   const [activeStep, setActiveStep] = useState(0);
   const [hoveredPointIndex, setHoveredPointIndex] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (!selectedFile) {
-      return undefined;
-    }
-
-    let isActive = true;
-
-    void selectedFile
-      .slice(0, 24 * 1024)
-      .text()
-      .then((snippet) => {
-        if (!isActive) {
-          return;
-        }
-
-        const { headers, rows } = parseCsvText(snippet);
-        setCsvPreview({
-          headers,
-          rows: rows.slice(0, 5),
-        });
-      })
-      .catch(() => {
-        if (!isActive) {
-          return;
-        }
-
-        setCsvPreview(null);
-      });
-
-    return () => {
-      isActive = false;
-    };
-  }, [selectedFile]);
+  const activeRunIdRef = useRef<string | null>(null);
 
   const statusTone = useMemo(() => {
     if (error) {
       return "destructive" as const;
     }
-    if (prediction) {
+    if (prediction?.status === "completed") {
       return "default" as const;
     }
-    if (isSubmitting) {
+    if (isSubmitting || prediction?.status === "queued" || prediction?.status === "running") {
       return "secondary" as const;
     }
     return "outline" as const;
   }, [error, isSubmitting, prediction]);
+  const isInferenceRunning =
+    isSubmitting || prediction?.status === "queued" || prediction?.status === "running";
 
   const sampledPoints = useMemo(
     () => sampleProgressivePoints(prediction?.progressivePoints ?? []),
@@ -432,22 +415,22 @@ export function RealtimeLearningWeb() {
     const charts = [
       {
         key: "probabilityUpTo120Percent" as const,
-        title: "0-120 sec probability",
-        description: "0-30 + 30-60 + 60-120 sec",
+        title: "0-120초 확률",
+        description: "0-30 + 30-60 + 60-120초",
         toneClass: "text-emerald-600",
         gradientId: "probability-band-under-120",
       },
       {
         key: "probability120To300Percent" as const,
-        title: "120-300 sec probability",
-        description: "120-180 + 180-300 sec",
+        title: "120-300초 확률",
+        description: "120-180 + 180-300초",
         toneClass: "text-amber-600",
         gradientId: "probability-band-120-300",
       },
       {
         key: "probabilityOver300Percent" as const,
-        title: ">300 sec probability",
-        description: "300-600 + >600 sec",
+        title: "300초 초과 확률",
+        description: "300-600 + 600초 초과",
         toneClass: "text-fuchsia-600",
         gradientId: "probability-band-over-300",
       },
@@ -457,7 +440,7 @@ export function RealtimeLearningWeb() {
       const chart = buildProbabilityBandLine(
         sampledPoints,
         CHART_WIDTH,
-        220,
+        PROBABILITY_CHART_HEIGHT,
         config.key,
       );
 
@@ -484,40 +467,21 @@ export function RealtimeLearningWeb() {
       return;
     }
 
+    const runId = crypto.randomUUID();
+    activeRunIdRef.current = runId;
     setError(null);
+    setPollNotice(null);
     setPrediction(null);
     setIsSubmitting(true);
     setProgressValue(8);
     setActiveStep(0);
     setHoveredPointIndex(null);
 
-    const intervalId = window.setInterval(() => {
-      setProgressValue((current) => {
-        if (current >= 90) {
-          return current;
-        }
-
-        const next = Math.min(current + 6 + Math.random() * 8, 90);
-
-        if (next >= 18) {
-          setActiveStep(1);
-        }
-        if (next >= 42) {
-          setActiveStep(2);
-        }
-        if (next >= 74) {
-          setActiveStep(3);
-        }
-
-        return next;
-      });
-    }, 360);
-
     try {
       const formData = new FormData();
       formData.append("featureCsv", selectedFile);
 
-      const response = await fetch("/api/predictions", {
+      const response = await fetch("/api/predictions/jobs", {
         method: "POST",
         body: formData,
       });
@@ -538,9 +502,82 @@ export function RealtimeLearningWeb() {
       }
 
       setPrediction(payload);
-      setProgressValue(100);
-      setActiveStep(PIPELINE_STEPS.length - 1);
+      setPollNotice(null);
+      setProgressValue(getRunProgress(payload));
+      setActiveStep(payload.progressivePoints.length > 0 ? 2 : 1);
+
+      let latestPayload = payload;
+      let consecutivePollFailures = 0;
+
+      while (
+        activeRunIdRef.current === runId &&
+        latestPayload.status !== "completed"
+      ) {
+        if (latestPayload.status === "failed") {
+          throw new Error(latestPayload.error ?? "EC2 inference job failed.");
+        }
+
+        await sleep(POLL_INTERVAL_MS);
+
+        const jobId = latestPayload.jobId ?? latestPayload.requestId;
+        try {
+          const pollResponse = await fetch(
+            `/api/predictions/jobs/${encodeURIComponent(jobId)}`,
+            { cache: "no-store" },
+          );
+          const pollPayload = (await pollResponse.json()) as
+            | RealtimeInferenceResponse
+            | { error?: string };
+
+          if (!pollResponse.ok) {
+            throw new Error(
+              "error" in pollPayload && pollPayload.error
+                ? pollPayload.error
+                : "Failed to poll realtime inference progress.",
+            );
+          }
+
+          if (!isRealtimeInferenceResponse(pollPayload)) {
+            throw new Error("The progress response did not match the expected contract.");
+          }
+
+          consecutivePollFailures = 0;
+          latestPayload = pollPayload;
+          setPollNotice(null);
+          setPrediction(pollPayload);
+          setProgressValue(getRunProgress(pollPayload));
+          setActiveStep(
+            pollPayload.status === "completed"
+              ? PIPELINE_STEPS.length - 1
+              : pollPayload.progressivePoints.length > 0
+                ? 3
+                : 2,
+          );
+        } catch (pollError) {
+          consecutivePollFailures += 1;
+          setPollNotice(
+            latestPayload.progressivePoints.length > 0
+              ? "EC2 응답이 잠시 끊겨서 다시 기다리는 중입니다."
+              : "EC2 잡을 기다리는 중입니다.",
+          );
+
+          if (consecutivePollFailures >= MAX_POLL_FAILURES) {
+            throw new Error(
+              pollError instanceof Error
+                ? `EC2 응답을 계속 받지 못했습니다. ${pollError.message}`
+                : "EC2 응답을 계속 받지 못했습니다.",
+            );
+          }
+        }
+      }
+
+      if (activeRunIdRef.current === runId) {
+        setPollNotice(null);
+        setProgressValue(100);
+        setActiveStep(PIPELINE_STEPS.length - 1);
+      }
     } catch (uploadError) {
+      setPollNotice(null);
       setError(
         uploadError instanceof Error
           ? uploadError.message
@@ -549,49 +586,54 @@ export function RealtimeLearningWeb() {
       setProgressValue(0);
       setActiveStep(0);
     } finally {
-      window.clearInterval(intervalId);
-      setIsSubmitting(false);
+      if (activeRunIdRef.current === runId) {
+        activeRunIdRef.current = null;
+        setIsSubmitting(false);
+      }
     }
   }
 
   function handleVideoSelect(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0] ?? null;
+    activeRunIdRef.current = null;
     setSelectedFile(file);
-    setCsvPreview(null);
     setPrediction(null);
     setError(null);
+    setPollNotice(null);
+    setIsSubmitting(false);
     setProgressValue(file ? 6 : 0);
     setActiveStep(0);
     setHoveredPointIndex(null);
   }
 
   function resetSelection() {
+    activeRunIdRef.current = null;
     setSelectedFile(null);
-    setCsvPreview(null);
     setPrediction(null);
     setError(null);
+    setPollNotice(null);
+    setIsSubmitting(false);
     setProgressValue(0);
     setActiveStep(0);
     setHoveredPointIndex(null);
   }
 
   return (
-    <main className="mx-auto flex min-w-0 w-full max-w-7xl flex-1 flex-col px-4 py-8 sm:px-6 lg:px-10">
-      <section className="grid min-w-0 gap-5 border-b border-border/80 pb-8 lg:grid-cols-[minmax(0,1.25fr)_minmax(280px,0.75fr)]">
+    <main className="mx-auto flex min-w-0 w-full max-w-[1500px] flex-1 flex-col px-4 py-6 sm:px-6 lg:px-8">
+      <section className="grid min-w-0 gap-5 border-b border-border/80 pb-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
         <div className="min-w-0 space-y-4">
           <Badge variant="outline" className="gap-1.5 border-primary/30 bg-primary/10 text-primary">
             <ScanLine className="size-3.5" />
-            Realtime learning web
+            실시간 학습 웹
           </Badge>
           <div className="space-y-2">
             <h1 className="max-w-2xl break-words text-2xl font-semibold tracking-tight text-foreground sm:text-3xl md:text-4xl">
-              Upload feature CSV and review realtime departure learning on the web.
+              CSV를 넣으면 EC2 추론 진행 상황을 그래프로 바로 확인합니다.
             </h1>
             <p className="max-w-3xl break-words text-sm leading-6 text-muted-foreground md:text-base">
-              This Vercel web surface mirrors the AIP BUS realtime-learning flow:
-              accept a bus YOLO feature CSV, relay it to EC2, and render the
-              returned progressive inference results as charts and bucket
-              probabilities.
+              AIP BUS YOLO feature CSV를 Vercel 웹에서 업로드하면 EC2가
+              실시간 학습 스크립트를 돌리고, 웹은 진행 중인 예측 포인트를
+              계속 받아 그래프에 누적해서 보여줍니다.
             </p>
           </div>
         </div>
@@ -603,62 +645,60 @@ export function RealtimeLearningWeb() {
               Feature CSV
             </div>
             <p className="mt-2 leading-6">
-              Upload a `*_vehicle_counts.csv` file created by bus YOLO analysis.
+              bus YOLO가 만든 `*_vehicle_counts.csv` 파일을 넣습니다.
             </p>
           </div>
           <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
             <div className="flex items-center gap-2 text-foreground">
               <BarChart3 className="size-4 text-primary" />
-              Trend graph
+              실시간 그래프
             </div>
             <p className="mt-2 leading-6">
-              Track how expected departure changes as the CSV rows accumulate.
+              row가 처리될 때마다 예측 변화가 누적됩니다.
             </p>
           </div>
           <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
             <div className="flex items-center gap-2 text-foreground">
               <CloudCog className="size-4 text-primary" />
-              EC2-ready hook
+              EC2 연결
             </div>
             <p className="mt-2 leading-6">
-              The route now forwards CSV uploads to an EC2 realtime inference API.
+              브라우저는 Next.js API를 통해서만 EC2와 통신합니다.
             </p>
           </div>
         </div>
       </section>
 
-      <section className="grid min-w-0 flex-1 gap-6 py-8 xl:grid-cols-[minmax(0,1.05fr)_minmax(380px,0.95fr)]">
+      <section className="grid min-w-0 flex-1 gap-5 py-6 xl:grid-cols-[320px_minmax(0,1fr)]">
         <Card className="min-w-0 border-border/80 bg-card/78 shadow-sm">
           <CardHeader className="space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="space-y-1">
-                <CardTitle className="text-xl">Feature CSV upload</CardTitle>
+                <CardTitle className="text-xl">CSV 업로드</CardTitle>
                 <CardDescription>
-                  Select a single feature CSV, then send it through the Vercel
-                  relay route to the EC2 realtime-learning API.
+                  feature CSV 하나를 선택해서 EC2 실시간 추론 job으로 보냅니다.
                 </CardDescription>
               </div>
               <Badge variant="outline" className="gap-1.5">
                 <Upload className="size-3.5" />
-                EC2 relay
+                EC2 전달
               </Badge>
             </div>
           </CardHeader>
-          <CardContent className="space-y-6">
+          <CardContent className="space-y-4">
             <label
               htmlFor="csv-upload"
-              className="flex min-h-56 cursor-pointer flex-col items-center justify-center gap-4 rounded-lg border border-dashed border-primary/35 bg-primary/6 px-6 py-8 text-center transition-colors hover:border-primary/55 hover:bg-primary/10"
+              className="flex min-h-32 cursor-pointer flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-primary/35 bg-primary/6 px-4 py-5 text-center transition-colors hover:border-primary/55 hover:bg-primary/10"
             >
-              <div className="rounded-full border border-primary/25 bg-background/70 p-3">
-                <FileSpreadsheet className="size-6 text-primary" />
+              <div className="rounded-full border border-primary/25 bg-background/70 p-2.5">
+                <FileSpreadsheet className="size-5 text-primary" />
               </div>
-              <div className="space-y-2">
-                <p className="text-base font-medium text-foreground">
-                  Drop the feature CSV here or click to browse
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-foreground">
+                  CSV 선택
                 </p>
-                <p className="text-sm leading-6 text-muted-foreground">
-                  One file per request. The ideal input is a
-                  `*_vehicle_counts.csv` generated by the AIP BUS YOLO pipeline.
+                <p className="text-xs leading-5 text-muted-foreground">
+                  `*_vehicle_counts.csv` 파일 1개
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-center gap-2 text-xs text-muted-foreground">
@@ -676,81 +716,32 @@ export function RealtimeLearningWeb() {
               onChange={handleVideoSelect}
             />
 
-            <div className="grid gap-3 text-sm sm:grid-cols-3">
+            <div className="grid gap-3 text-sm">
               <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                <div className="text-muted-foreground">Selected file</div>
+                <div className="text-muted-foreground">선택한 파일</div>
                 <div className="mt-2 truncate font-medium text-foreground">
-                  {selectedFile ? selectedFile.name : "No file selected"}
+                  {selectedFile ? selectedFile.name : "아직 없음"}
                 </div>
               </div>
               <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                <div className="text-muted-foreground">Size</div>
+                <div className="text-muted-foreground">크기</div>
                 <div className="mt-2 font-medium text-foreground">
                   {selectedFile ? formatFileSize(selectedFile.size) : "-"}
                 </div>
               </div>
-              <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                <div className="text-muted-foreground">MIME type</div>
-                <div className="mt-2 truncate font-medium text-foreground">
-                  {selectedFile ? selectedFile.type || "text/csv" : "-"}
-                </div>
-              </div>
             </div>
-
-            {csvPreview?.headers.length ? (
-              <div className="space-y-3 overflow-hidden rounded-lg border border-border/80 bg-background/85 p-4">
-                <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                  <Table2 className="size-4 text-primary" />
-                  CSV preview
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="min-w-full text-left text-sm">
-                    <thead>
-                      <tr className="border-b border-border/70 text-muted-foreground">
-                        {csvPreview.headers.slice(0, 6).map((header) => (
-                          <th key={header} className="px-3 py-2 font-medium">
-                            {header}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {csvPreview.rows.map((row, rowIndex) => (
-                        <tr key={`${rowIndex}-${row[0] ?? "row"}`} className="border-b border-border/40">
-                          {row.slice(0, 6).map((value, valueIndex) => (
-                            <td
-                              key={`${rowIndex}-${valueIndex}`}
-                              className="max-w-44 truncate px-3 py-2 text-muted-foreground"
-                            >
-                              {value}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  Previewing the first few rows only.
-                </div>
-              </div>
-            ) : (
-              <div className="flex min-h-52 items-center justify-center rounded-lg border border-border/80 bg-background/65 text-sm text-muted-foreground">
-                The selected CSV headers and sample rows appear here.
-              </div>
-            )}
 
             <div className="flex flex-wrap items-center gap-3">
               <Button onClick={handleUpload} disabled={!selectedFile || isSubmitting}>
                 {isSubmitting ? (
                   <>
                     <LoaderCircle className="animate-spin" />
-                    Sending to EC2
+                    EC2 처리 중
                   </>
                 ) : (
                   <>
                     <Upload />
-                    Upload and infer
+                    업로드 시작
                   </>
                 )}
               </Button>
@@ -760,14 +751,13 @@ export function RealtimeLearningWeb() {
                 disabled={!selectedFile && !prediction && !error}
               >
                 <Trash2 />
-                Clear
+                초기화
               </Button>
             </div>
 
             <div className="rounded-lg border border-border/70 bg-muted/35 px-4 py-3 text-sm leading-6 text-muted-foreground">
-              `POST /api/predictions` is the Vercel relay point. It accepts one
-              feature CSV file, then forwards it to the EC2 realtime-learning
-              API configured through environment variables.
+              업로드 후에는 job을 만들고 1초 간격으로 진행 포인트를 받아와
+              그래프에 바로 반영합니다.
             </div>
           </CardContent>
         </Card>
@@ -776,35 +766,34 @@ export function RealtimeLearningWeb() {
           <CardHeader className="space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="space-y-1">
-                <CardTitle className="text-xl">Probability sector</CardTitle>
+                <CardTitle className="text-xl">실시간 예측 그래프</CardTitle>
                 <CardDescription>
-                  Status, progressive trend graph, and bucket probabilities for
-                  the latest inference run.
+                  EC2가 처리한 row가 들어오는 대로 그래프를 계속 업데이트합니다.
                 </CardDescription>
               </div>
               <Badge variant={statusTone} className="gap-1.5">
-                {prediction ? (
+                {prediction?.status === "completed" ? (
                   <CheckCircle2 className="size-3.5" />
-                ) : isSubmitting ? (
+                ) : isInferenceRunning ? (
                   <LoaderCircle className="size-3.5 animate-spin" />
                 ) : error ? (
                   <Activity className="size-3.5" />
                 ) : (
                   <CircleDashed className="size-3.5" />
                 )}
-                {prediction
+                {prediction?.status === "completed"
                   ? "Probability ready"
-                  : isSubmitting
-                    ? "Processing"
+                  : isInferenceRunning
+                    ? "실시간 수신 중"
                     : error
-                      ? "Needs retry"
-                      : "Waiting"}
+                      ? "재시도 필요"
+                      : "대기 중"}
               </Badge>
             </div>
 
             <div className="space-y-3">
               <div className="flex items-center justify-between text-sm text-muted-foreground">
-                <span>Inference progress</span>
+                <span>처리 진행률</span>
                 <span>{Math.round(progressValue)}%</span>
               </div>
               <Progress value={progressValue} className="h-2.5" />
@@ -813,8 +802,12 @@ export function RealtimeLearningWeb() {
           <CardContent className="space-y-6">
             <div className="space-y-3">
               {PIPELINE_STEPS.map((step, index) => {
-                const isComplete = prediction ? true : index < activeStep;
-                const isActive = !prediction && isSubmitting && index === activeStep;
+                const isComplete =
+                  prediction?.status === "completed" || index < activeStep;
+                const isActive =
+                  prediction?.status !== "completed" &&
+                  isInferenceRunning &&
+                  index === activeStep;
 
                 return (
                   <div
@@ -851,49 +844,59 @@ export function RealtimeLearningWeb() {
               </div>
             ) : null}
 
+            {!error && pollNotice ? (
+              <div className="rounded-lg border border-amber-300/60 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                {pollNotice}
+              </div>
+            ) : null}
+
             {prediction ? (
               <div className="space-y-6">
                 <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Clock3 className="size-4 text-primary" />
-                      Expected departure
+                      예상 출발까지
                     </div>
                     <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
-                      {formatSeconds(prediction.summary.expectedDepartureInSec)}
+                      {prediction.summary.processedRows > 0
+                        ? formatSeconds(prediction.summary.expectedDepartureInSec)
+                        : "대기 중"}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      around {prediction.summary.predictedDepartureAt}
+                      {prediction.summary.predictedDepartureAt
+                        ? `예상 시각 ${prediction.summary.predictedDepartureAt}`
+                        : "EC2 job 시작 중"}
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <BarChart3 className="size-4 text-primary" />
-                      Most likely bucket
+                      최우선 버킷
                     </div>
                     <div className="mt-3 text-2xl font-semibold tracking-tight text-foreground">
-                      {prediction.summary.bestBucketLabel}
+                      {prediction.summary.bestBucketLabel || "row 수집 중"}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      Source: {prediction.source}
+                      상태: {prediction.source} / {prediction.status}
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <Database className="size-4 text-primary" />
-                      ROI out events
+                      ROI out 이벤트
                     </div>
                     <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
                       {prediction.summary.gateOutEvents}
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      blue markers on the trend graph
+                      그래프의 파란 마커
                     </p>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <RefreshCw className="size-4 text-primary" />
-                      Retrain count
+                      재학습 횟수
                     </div>
                     <div className="mt-3 text-3xl font-semibold tracking-tight text-foreground">
                       {prediction.summary.retrainCount}
@@ -907,35 +910,40 @@ export function RealtimeLearningWeb() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-sm font-medium text-foreground">
-                      Expected departure trend by elapsed time
+                      시간 흐름별 예상 출발 추세
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      Hover a point to inspect departure timing
+                      점 위에 올리면 해당 시점 예측을 확인할 수 있습니다
                     </div>
                   </div>
                   <div className="rounded-lg border border-border/70 bg-background/70 p-4">
                     <div className="relative">
+                      {lineChart.markers.length === 0 ? (
+                        <div className="absolute inset-0 z-10 flex items-center justify-center rounded-md bg-background/70 text-sm text-muted-foreground">
+                          EC2에서 첫 진행 포인트를 받는 중입니다
+                        </div>
+                      ) : null}
                       {hoveredPoint && tooltipPosition ? (
                         <div
                           className="pointer-events-none absolute z-10 w-52 -translate-x-1/2 -translate-y-[calc(100%+0.75rem)] rounded-lg border border-border/80 bg-popover/96 px-3 py-2 text-left shadow-lg backdrop-blur-sm"
                           style={tooltipPosition}
                         >
                           <div className="text-[11px] uppercase tracking-[0.08em] text-muted-foreground">
-                            Expected departure
+                            예상 출발까지
                           </div>
                           <div className="mt-1 text-sm font-semibold text-foreground">
                             {formatSeconds(hoveredPoint.expectedDepartureInSec)}
                           </div>
                           <div className="mt-2 text-xs leading-5 text-muted-foreground">
-                            Current time {hoveredPoint.currentTimeLabel}
+                            현재 시각 {hoveredPoint.currentTimeLabel}
                           </div>
                           <div className="text-xs leading-5 text-muted-foreground">
-                            Top bucket {hoveredPoint.topBucket} ({hoveredPoint.topBucketProbabilityPercent}%)
+                            최우선 버킷 {hoveredPoint.topBucket} ({hoveredPoint.topBucketProbabilityPercent}%)
                           </div>
                           {hoveredPoint.currentGateOutEvent > 0 ? (
                             <div className="mt-2 inline-flex items-center gap-2 text-xs font-medium text-sky-600">
                               <span className="size-2 rounded-full bg-sky-500" />
-                              ROI out detected
+                              ROI out 감지
                             </div>
                           ) : null}
                         </div>
@@ -945,7 +953,7 @@ export function RealtimeLearningWeb() {
                         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
                         className="h-64 w-full"
                         role="img"
-                        aria-label="Expected departure trend chart"
+                        aria-label="시간 흐름별 예상 출발 추세 그래프"
                       >
                         <defs>
                           <linearGradient id="trend-fill" x1="0" x2="0" y1="0" y2="1">
@@ -998,7 +1006,7 @@ export function RealtimeLearningWeb() {
                             cy={marker.y}
                             r={marker.highlighted ? 5.2 : 3.2}
                             tabIndex={0}
-                            aria-label={`${marker.point.currentTimeLabel}, expected departure ${formatSeconds(marker.point.expectedDepartureInSec)}`}
+                            aria-label={`${marker.point.currentTimeLabel}, 예상 출발까지 ${formatSeconds(marker.point.expectedDepartureInSec)}`}
                             onMouseEnter={() => setHoveredPointIndex(marker.index)}
                             onFocus={() => setHoveredPointIndex(marker.index)}
                             onMouseLeave={() => setHoveredPointIndex(null)}
@@ -1025,10 +1033,10 @@ export function RealtimeLearningWeb() {
                         <div className="absolute bottom-0 left-0 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
                           <span className="flex items-center gap-2">
                             <span className="size-2 rounded-full bg-sky-500" />
-                            ROI out markers ({gateOutMarkerCount})
+                            ROI out 마커 ({gateOutMarkerCount})
                           </span>
                           <span>
-                            Range: {formatSeconds(lineChart.minValue)} - {formatSeconds(lineChart.maxValue)}
+                            범위: {formatSeconds(lineChart.minValue)} - {formatSeconds(lineChart.maxValue)}
                           </span>
                         </div>
                       </div>
@@ -1038,7 +1046,7 @@ export function RealtimeLearningWeb() {
 
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-foreground">
-                    Grouped bucket probability trends
+                    묶음 버킷 확률 추세
                   </div>
                   {hasGroupedProbabilityCharts ? (
                     <div className="grid gap-4 xl:grid-cols-3">
@@ -1065,8 +1073,8 @@ export function RealtimeLearningWeb() {
                             <>
                               <div className="mt-4">
                                 <svg
-                                  viewBox={`0 0 ${CHART_WIDTH} 220`}
-                                  className="h-48 w-full"
+                                  viewBox={`0 0 ${CHART_WIDTH} ${PROBABILITY_CHART_HEIGHT}`}
+                                  className="h-56 w-full"
                                   role="img"
                                   aria-label={`${group.title} chart`}
                                 >
@@ -1107,7 +1115,7 @@ export function RealtimeLearningWeb() {
                                     x1={group.chart.padding.left}
                                     x2={CHART_WIDTH - group.chart.padding.right}
                                     y1={group.chart.baselineY}
-                                    y2={group.chart.baselineY}
+                                      y2={group.chart.baselineY}
                                     stroke="currentColor"
                                     strokeOpacity="0.18"
                                     className="text-foreground"
@@ -1162,16 +1170,15 @@ export function RealtimeLearningWeb() {
                                 <div className="absolute bottom-0 left-0 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
                                   <span className="flex items-center gap-2">
                                     <span className="size-2 rounded-full bg-sky-500" />
-                                    ROI out markers
+                                    ROI out 마커
                                   </span>
-                                  <span>0% - 100% probability scale</span>
+                                  <span>0% - 100% 확률 스케일</span>
                                 </div>
                               </div>
                             </>
                           ) : (
                             <div className="mt-4 rounded-lg border border-dashed border-border/70 bg-muted/25 px-4 py-5 text-sm leading-6 text-muted-foreground">
-                              EC2 has not returned per-row bucket probabilities
-                              for this grouped series yet.
+                              아직 이 구간의 row별 버킷 확률이 들어오지 않았습니다.
                             </div>
                           )}
                         </div>
@@ -1179,60 +1186,64 @@ export function RealtimeLearningWeb() {
                     </div>
                   ) : (
                     <div className="rounded-lg border border-dashed border-border/70 bg-background/60 px-4 py-5 text-sm leading-6 text-muted-foreground">
-                      Current EC2 JSON includes the final bucket snapshot, but it
-                      does not yet expose per-row `prob_*` bucket probabilities.
-                      Once the backend returns those progressive fields, the
-                      grouped probability trends for `0-120`, `120-300`, and
-                      `over 300 sec` will render here automatically.
+                      EC2가 row별 `prob_*` 값을 보내면 0-120초, 120-300초,
+                      300초 초과 확률 그래프가 여기에 표시됩니다.
                     </div>
                   )}
                 </div>
 
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-foreground">
-                    Final bucket snapshot
+                    최종 버킷 스냅샷
                   </div>
-                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                    {prediction.finalBuckets.map((bucket) => (
-                      <div
-                        key={bucket.label}
-                        className="rounded-lg border border-border/70 bg-background/70 p-4"
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <div className="font-medium text-foreground">{bucket.label}</div>
-                            <div className="text-xs text-muted-foreground">
-                              {bucket.etaStartLabel}
-                              {bucket.etaEndLabel ? ` - ${bucket.etaEndLabel}` : "+"}
+                  {prediction.finalBuckets.length ? (
+                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      {prediction.finalBuckets.map((bucket) => (
+                        <div
+                          key={bucket.label}
+                          className="rounded-lg border border-border/70 bg-background/70 p-4"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="font-medium text-foreground">{bucket.label}</div>
+                              <div className="text-xs text-muted-foreground">
+                                {bucket.etaStartLabel}
+                                {bucket.etaEndLabel ? ` - ${bucket.etaEndLabel}` : "+"}
+                              </div>
+                            </div>
+                            <div className="text-sm font-medium text-foreground">
+                              {bucket.probabilityPercent}%
                             </div>
                           </div>
-                          <div className="text-sm font-medium text-foreground">
-                            {bucket.probabilityPercent}%
+                          <div className="mt-4 flex h-36 items-end justify-center rounded-md border border-border/50 bg-muted/25 p-2">
+                            <div
+                              className="w-12 rounded-t-md bg-primary/85 transition-[height]"
+                              style={{
+                                height: `${Math.max(bucket.probabilityPercent, 4)}%`,
+                              }}
+                            />
                           </div>
+                          <Progress value={bucket.probabilityPercent} className="mt-3 h-2" />
                         </div>
-                        <div className="mt-4 flex h-36 items-end justify-center rounded-md border border-border/50 bg-muted/25 p-2">
-                          <div
-                            className="w-12 rounded-t-md bg-primary/85 transition-[height]"
-                            style={{
-                              height: `${Math.max(bucket.probabilityPercent, 4)}%`,
-                            }}
-                          />
-                        </div>
-                        <Progress value={bucket.probabilityPercent} className="mt-3 h-2" />
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-dashed border-border/70 bg-background/60 px-4 py-5 text-sm leading-6 text-muted-foreground">
+                      EC2 job이 끝나면 최종 버킷 확률이 표시됩니다. 그 전에도
+                      진행 중인 추세 그래프는 계속 업데이트됩니다.
+                    </div>
+                  )}
                 </div>
 
                 <Separator />
 
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-foreground">
-                    Inference run details
+                    추론 실행 정보
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Uploaded CSV</div>
+                      <div className="text-sm text-muted-foreground">업로드 CSV</div>
                       <div className="mt-2 text-base font-semibold text-foreground">
                         {prediction.uploadedCsv.name}
                       </div>
@@ -1241,20 +1252,20 @@ export function RealtimeLearningWeb() {
                       </div>
                     </div>
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Columns detected</div>
+                      <div className="text-sm text-muted-foreground">감지된 컬럼</div>
                       <div className="mt-2 text-sm font-medium leading-6 text-foreground">
                         {prediction.uploadedCsv.columns.slice(0, 6).join(", ")}
                         {prediction.uploadedCsv.columns.length > 6 ? ", ..." : ""}
                       </div>
                     </div>
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Best bucket confidence</div>
+                      <div className="text-sm text-muted-foreground">최우선 버킷 신뢰도</div>
                       <div className="mt-2 text-xl font-semibold text-foreground">
                         {prediction.summary.bestBucketProbabilityPercent}%
                       </div>
                     </div>
                     <div className="rounded-lg border border-border/70 bg-background/70 p-4">
-                      <div className="text-sm text-muted-foreground">Generated at</div>
+                      <div className="text-sm text-muted-foreground">생성 시각</div>
                       <div className="mt-2 text-sm font-semibold text-foreground">
                         {new Intl.DateTimeFormat("ko-KR", {
                           dateStyle: "short",
@@ -1267,7 +1278,7 @@ export function RealtimeLearningWeb() {
 
                 {prediction.notes.length ? (
                   <div className="rounded-lg border border-primary/20 bg-primary/8 px-4 py-3 text-sm leading-6 text-muted-foreground">
-                    <div className="font-medium text-foreground">Integration notes</div>
+                    <div className="font-medium text-foreground">연동 메모</div>
                     <ul className="mt-2 space-y-1">
                       {prediction.notes.map((note) => (
                         <li key={note}>- {note}</li>
@@ -1280,12 +1291,11 @@ export function RealtimeLearningWeb() {
               <div className="flex min-h-72 flex-col justify-center gap-3 rounded-lg border border-dashed border-border/75 bg-background/60 px-5 py-6">
                 <div className="flex items-center gap-2 text-foreground">
                   <FileSpreadsheet className="size-5 text-primary" />
-                  Probability sector is waiting for a feature CSV
+                  feature CSV를 기다리는 중입니다
                 </div>
                 <p className="max-w-md text-sm leading-6 text-muted-foreground">
-                  Upload one bus YOLO feature CSV from the left panel to see the
-                  progressive departure trend, bucket probabilities, and
-                  realtime-learning summary returned from EC2.
+                  왼쪽에서 bus YOLO feature CSV를 업로드하면 EC2에서 들어오는
+                  진행 포인트와 버킷 확률을 큰 그래프로 확인할 수 있습니다.
                 </p>
               </div>
             )}

@@ -37,7 +37,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const ec2Endpoint = getEc2Endpoint();
+  const ec2Endpoint = getEc2Endpoint("/jobs");
   if (!ec2Endpoint) {
     return NextResponse.json(
       {
@@ -47,9 +47,6 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
-
-  const upstreamFormData = new FormData();
-  upstreamFormData.append("feature_csv", featureCsv as File, (featureCsv as File).name);
 
   const headers = buildEc2Headers();
   if (!headers) {
@@ -61,6 +58,13 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
+
+  const upstreamFormData = new FormData();
+  upstreamFormData.append(
+    "feature_csv",
+    featureCsv as File,
+    (featureCsv as File).name,
+  );
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
@@ -75,7 +79,6 @@ export async function POST(request: Request) {
       signal: controller.signal,
       cache: "no-store",
     });
-
     const payload = await readEc2Payload(upstreamResponse);
 
     if (!upstreamResponse.ok) {
@@ -83,7 +86,7 @@ export async function POST(request: Request) {
         {
           error: extractErrorMessage(
             payload,
-            `EC2 inference request failed with status ${upstreamResponse.status}.`,
+            `EC2 inference job request failed with status ${upstreamResponse.status}.`,
           ),
         },
         { status: upstreamResponse.status },
@@ -94,7 +97,7 @@ export async function POST(request: Request) {
   } catch (error) {
     const message =
       error instanceof Error && error.name === "AbortError"
-        ? "The EC2 inference request timed out."
+        ? "The EC2 inference job request timed out."
         : error instanceof Error
           ? error.message
           : "Unknown EC2 inference error.";

@@ -116,55 +116,55 @@ function normalizeSummary(
   value: unknown,
   lastPoint: ProgressivePoint | null,
 ): InferenceSummary | null {
-  if (!value || typeof value !== "object") {
-    return null;
-  }
-
-  const record = value as Record<string, unknown>;
-  const method = readString(record, "method");
+  const record =
+    value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const method = readString(record, "method") ?? "realtime_learning";
   const bestBucketLabel = readString(
     record,
     "bestBucketLabel",
     "best_bucket_label",
-  );
+  ) ?? lastPoint?.topBucket ?? "";
   const bestBucketProbabilityPercent = readNumber(
     record,
     "bestBucketProbabilityPercent",
     "best_bucket_probability_percent",
-  );
+  ) ?? lastPoint?.topBucketProbabilityPercent ?? 0;
   const expectedDepartureInSec = readNumber(
     record,
     "expectedDepartureInSec",
     "expected_departure_in_sec",
-  );
+  ) ?? lastPoint?.expectedDepartureInSec ?? 0;
   const predictedDepartureAt =
     readString(
-    record,
-    "predictedDepartureAt",
-    "predicted_departure_at",
-    "predicted_departure_hhmmss",
-  ) ??
+      record,
+      "predictedDepartureAt",
+      "predicted_departure_at",
+      "predicted_departure_hhmmss",
+    ) ??
     lastPoint?.predictedDepartureAt ??
-    null;
-  const processedRows = readNumber(record, "processedRows", "processed_rows");
-  const gateOutEvents = readNumber(record, "gateOutEvents", "gate_out_events");
-  const retrainCount = readNumber(record, "retrainCount", "retrain_count");
+    "";
+  const processedRows =
+    readNumber(record, "processedRows", "processed_rows") ??
+    lastPoint?.prefixRows ??
+    0;
+  const gateOutEvents =
+    readNumber(record, "gateOutEvents", "gate_out_events") ??
+    lastPoint?.seenGateOutEvents ??
+    0;
+  const retrainCount = readNumber(record, "retrainCount", "retrain_count") ?? 0;
   const activeModelPath = readNullableString(
     record,
     "activeModelPath",
     "active_model_path",
   );
-  const generatedAt = readString(record, "generatedAt", "generated_at");
+  const generatedAt =
+    readString(record, "generatedAt", "generated_at") ??
+    new Date().toISOString();
 
   if (
     !method ||
-    !bestBucketLabel ||
-    bestBucketProbabilityPercent === null ||
-    expectedDepartureInSec === null ||
-    !predictedDepartureAt ||
     processedRows === null ||
     gateOutEvents === null ||
-    retrainCount === null ||
     !generatedAt
   ) {
     return null;
@@ -249,7 +249,7 @@ function normalizeFinalBuckets(
     })
     .filter((entry): entry is ProbabilityBucketResult => entry !== null);
 
-  return buckets.length ? buckets : null;
+  return buckets;
 }
 
 function normalizeProgressivePoints(value: unknown): ProgressivePoint[] | null {
@@ -378,7 +378,7 @@ function normalizeProgressivePoints(value: unknown): ProgressivePoint[] | null {
     })
     .filter((entry): entry is ProgressivePoint => entry !== null);
 
-  return points.length ? points : null;
+  return points;
 }
 
 export function normalizeRealtimeInferenceResponse(
@@ -390,6 +390,7 @@ export function normalizeRealtimeInferenceResponse(
 
   const record = value as Record<string, unknown>;
   const requestId = readString(record, "requestId", "request_id");
+  const jobId = readString(record, "jobId", "job_id") ?? undefined;
   const status = readString(record, "status");
   const source = readString(record, "source") ?? "ec2";
   const uploadedCsv = normalizeUploadedCsv(
@@ -411,7 +412,8 @@ export function normalizeRealtimeInferenceResponse(
 
   if (
     !requestId ||
-    status !== "completed" ||
+    !status ||
+    !["queued", "running", "completed", "failed"].includes(status) ||
     !uploadedCsv ||
     !summary ||
     !finalBuckets ||
@@ -422,12 +424,14 @@ export function normalizeRealtimeInferenceResponse(
 
   return {
     requestId,
-    status: "completed",
+    ...(jobId ? { jobId } : {}),
+    status: status as RealtimeInferenceResponse["status"],
     source,
     uploadedCsv,
     summary,
     finalBuckets,
     progressivePoints,
+    error: readNullableString(record, "error"),
     notes,
   };
 }

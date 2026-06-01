@@ -58,12 +58,14 @@ export type InferenceSummary = {
 
 export type RealtimeInferenceResponse = {
   requestId: string;
-  status: "completed";
+  jobId?: string;
+  status: "queued" | "running" | "completed" | "failed";
   source: string;
   uploadedCsv: UploadedCsvSummary;
   summary: InferenceSummary;
   finalBuckets: ProbabilityBucketResult[];
   progressivePoints: ProgressivePoint[];
+  error?: string | null;
   notes: string[];
 };
 
@@ -78,7 +80,8 @@ export function isRealtimeInferenceResponse(
 
   return (
     typeof candidate.requestId === "string" &&
-    candidate.status === "completed" &&
+    typeof candidate.status === "string" &&
+    ["queued", "running", "completed", "failed"].includes(candidate.status) &&
     typeof candidate.source === "string" &&
     !!candidate.uploadedCsv &&
     !!candidate.summary &&

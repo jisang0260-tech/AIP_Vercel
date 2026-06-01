@@ -11,11 +11,13 @@ learning result with charts and bucket probabilities.
 Current request flow:
 
 1. user uploads a `*_vehicle_counts.csv` file in the browser
-2. Next.js route `POST /api/predictions` validates the file
-3. the route forwards the CSV to the EC2 inference endpoint
-4. EC2 runs `realtime_departure_learning.py`
-5. EC2 returns a JSON payload
-6. the web app renders:
+2. Next.js route `POST /api/predictions/jobs` validates the file
+3. the route forwards the CSV to the EC2 job endpoint
+4. EC2 starts `realtime_departure_learning.py` in the background
+5. the browser polls `GET /api/predictions/jobs/[jobId]`
+6. EC2 returns progressive JSON while the script is still running
+7. EC2 returns final bucket probabilities when the job completes
+8. the web app renders:
    - summary cards
    - expected departure trend graph
    - bucket probability chart
@@ -87,7 +89,11 @@ npm run build
 - [`src/components/realtime-learning-web.tsx`](./src/components/realtime-learning-web.tsx)
   - main CSV upload screen and chart dashboard
 - [`src/app/api/predictions/route.ts`](./src/app/api/predictions/route.ts)
-  - Vercel relay route for forwarding CSV uploads to EC2
+  - synchronous Vercel relay route for forwarding CSV uploads to EC2
+- [`src/app/api/predictions/jobs/route.ts`](./src/app/api/predictions/jobs/route.ts)
+  - starts an EC2 realtime inference job and returns a `jobId`
+- [`src/app/api/predictions/jobs/[jobId]/route.ts`](./src/app/api/predictions/jobs/[jobId]/route.ts)
+  - polls EC2 for progressive points while the job runs
 - [`src/lib/inference-contract.ts`](./src/lib/inference-contract.ts)
   - shared JSON contract expected from EC2
 - [`src/lib/csv-utils.ts`](./src/lib/csv-utils.ts)
@@ -100,7 +106,8 @@ The web expects EC2 to return a JSON payload shaped like this:
 ```ts
 type RealtimeInferenceResponse = {
   requestId: string;
-  status: "completed";
+  jobId?: string;
+  status: "queued" | "running" | "completed" | "failed";
   source: string;
   uploadedCsv: {
     name: string;
@@ -144,10 +151,23 @@ type RealtimeInferenceResponse = {
     seenGateOutEvents: number;
   }>;
   notes: string[];
+  error?: string | null;
 };
 ```
 
-The easiest EC2 implementation is:
+For progressive rendering, EC2 should expose:
+
+1. `POST /inference/realtime-learning/jobs`
+   - receives `feature_csv`
+   - saves it to a temp path
+   - returns `202` with `jobId`
+   - starts the realtime script in the background
+2. `GET /inference/realtime-learning/jobs/{jobId}`
+   - reads the currently flushed progressive CSV
+   - returns `status: "running"` plus accumulated `progressivePoints`
+   - returns `status: "completed"` plus `finalBuckets` when done
+
+The synchronous fallback endpoint is still:
 
 1. receive uploaded CSV
 2. save it to a temp path
@@ -177,9 +197,11 @@ goal and keeps the frontend architecture simple.
 In Vercel production, the intended request path is:
 
 1. user uploads a feature CSV on the deployed Vercel URL
-2. browser sends the file to `POST /api/predictions`
+2. browser sends the file to `POST /api/predictions/jobs`
 3. the Next.js server route reads `EC2_REALTIME_LEARNING_URL`,
    `EC2_INFERENCE_API_KEY`, and `EC2_REQUEST_TIMEOUT_MS`
-4. the server route forwards the CSV to the EC2 FastAPI endpoint
-5. EC2 returns JSON
-6. the Vercel app renders charts and bucket probabilities from that response
+4. the server route forwards the CSV to the EC2 FastAPI job endpoint
+5. the browser polls `GET /api/predictions/jobs/[jobId]`
+6. the Next.js server route polls EC2 with the server-only API key
+7. the Vercel app updates charts as progressive points arrive
+8. final bucket probabilities appear when EC2 completes the job
