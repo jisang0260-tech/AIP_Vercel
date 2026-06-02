@@ -6,13 +6,11 @@ import {
   BarChart3,
   CheckCircle2,
   CircleDashed,
-  CloudCog,
   Clock3,
   Database,
   FileSpreadsheet,
   LoaderCircle,
   RefreshCw,
-  ScanLine,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -53,7 +51,7 @@ const PIPELINE_STEPS = [
   },
   {
     label: "그래프 완료",
-    description: "최종 버킷 확률과 추세 그래프를 표시합니다.",
+    description: "추세 그래프와 오차 지표를 표시합니다.",
   },
 ] as const;
 
@@ -77,11 +75,31 @@ type EvaluatedErrorPoint = ProgressivePoint & {
   absoluteErrorSec: number;
 };
 
+type ActualErrorBucketSummary = {
+  label: string;
+  rows: number;
+  meanAbsoluteError: number;
+  medianAbsoluteError: number;
+  meanSignedError: number;
+  meanPredictedDelay: number;
+  meanActualDelay: number;
+  isBest: boolean;
+};
+
 const CHART_WIDTH = 720;
 const CHART_HEIGHT = 360;
 const PROBABILITY_CHART_HEIGHT = 260;
 const POLL_INTERVAL_MS = 1000;
 const MAX_POLL_FAILURES = 5;
+const ACTUAL_ERROR_BUCKETS = [
+  { label: "0-30초", startSec: 0, endSec: 30 },
+  { label: "30-60초", startSec: 30, endSec: 60 },
+  { label: "60-120초", startSec: 60, endSec: 120 },
+  { label: "120-180초", startSec: 120, endSec: 180 },
+  { label: "180-300초", startSec: 180, endSec: 300 },
+  { label: "300-600초", startSec: 300, endSec: 600 },
+  { label: "600초 이상", startSec: 600, endSec: null },
+] as const;
 
 function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) {
@@ -99,12 +117,12 @@ function formatSeconds(seconds: number) {
   const roundedSeconds = Math.max(0, Math.round(seconds));
 
   if (roundedSeconds < 60) {
-    return `${roundedSeconds} sec`;
+    return `${roundedSeconds}초`;
   }
 
   const minutes = Math.floor(roundedSeconds / 60);
   const remainingSeconds = roundedSeconds % 60;
-  return `${minutes} min ${remainingSeconds} sec`;
+  return `${minutes}분 ${remainingSeconds}초`;
 }
 
 function formatSignedSeconds(seconds: number) {
@@ -116,10 +134,10 @@ function formatMinuteAxisLabel(seconds: number) {
   const minutes = Math.max(0, seconds) / 60;
 
   if (minutes >= 10) {
-    return `${Math.round(minutes)} min`;
+    return `${Math.round(minutes)}분`;
   }
 
-  return `${minutes.toFixed(1)} min`;
+  return `${minutes.toFixed(1)}분`;
 }
 
 function isEvaluatedErrorPoint(
@@ -182,6 +200,60 @@ function median(values: number[]) {
   }
 
   return (sorted[middleIndex - 1] + sorted[middleIndex]) / 2;
+}
+
+function mean(values: number[]) {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function buildActualErrorBucketSummaries(
+  points: EvaluatedErrorPoint[],
+): ActualErrorBucketSummary[] {
+  const summaries = ACTUAL_ERROR_BUCKETS.map((bucket) => {
+    const bucketPoints = points.filter((point) => {
+      const actualDelay = point.actualTimeUntilDepartureSec;
+      return (
+        actualDelay >= bucket.startSec &&
+        (bucket.endSec === null || actualDelay < bucket.endSec)
+      );
+    });
+    const absoluteErrors = bucketPoints.map((point) => point.absoluteErrorSec);
+    const signedErrors = bucketPoints.map((point) => point.predictionErrorSec);
+    const predictedDelays = bucketPoints.map(
+      (point) => point.expectedDepartureInSec,
+    );
+    const actualDelays = bucketPoints.map(
+      (point) => point.actualTimeUntilDepartureSec,
+    );
+
+    return {
+      label: bucket.label,
+      rows: bucketPoints.length,
+      meanAbsoluteError: mean(absoluteErrors),
+      medianAbsoluteError: median(absoluteErrors),
+      meanSignedError: mean(signedErrors),
+      meanPredictedDelay: mean(predictedDelays),
+      meanActualDelay: mean(actualDelays),
+      isBest: false,
+    };
+  });
+  const bestMeanError = Math.min(
+    ...summaries
+      .filter((summary) => summary.rows > 0)
+      .map((summary) => summary.meanAbsoluteError),
+  );
+
+  return summaries.map((summary) => ({
+    ...summary,
+    isBest:
+      summary.rows > 0 &&
+      Number.isFinite(bestMeanError) &&
+      summary.meanAbsoluteError === bestMeanError,
+  }));
 }
 
 function buildAreaPath(
@@ -594,6 +666,20 @@ export function RealtimeLearningWeb() {
       meanSignedError,
     };
   }, [evaluatedErrorPoints]);
+  const actualErrorBucketSummaries = useMemo(
+    () => buildActualErrorBucketSummaries(evaluatedErrorPoints),
+    [evaluatedErrorPoints],
+  );
+  const maxActualBucketMeanError = useMemo(
+    () =>
+      Math.max(
+        1,
+        ...actualErrorBucketSummaries
+          .filter((summary) => summary.rows > 0)
+          .map((summary) => summary.meanAbsoluteError),
+      ),
+    [actualErrorBucketSummaries],
+  );
   const groupedProbabilityCharts = useMemo(() => {
     const charts = [
       {
@@ -803,56 +889,7 @@ export function RealtimeLearningWeb() {
 
   return (
     <main className="mx-auto flex min-w-0 w-full max-w-[1500px] flex-1 flex-col px-4 py-6 sm:px-6 lg:px-8">
-      <section className="grid min-w-0 gap-5 border-b border-border/80 pb-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
-        <div className="min-w-0 space-y-4">
-          <Badge variant="outline" className="gap-1.5 border-primary/30 bg-primary/10 text-primary">
-            <ScanLine className="size-3.5" />
-            실시간 학습 웹
-          </Badge>
-          <div className="space-y-2">
-            <h1 className="max-w-2xl break-words text-2xl font-semibold tracking-tight text-foreground sm:text-3xl md:text-4xl">
-              CSV를 넣으면 EC2 추론 진행 상황을 그래프로 바로 확인합니다.
-            </h1>
-            <p className="max-w-3xl break-words text-sm leading-6 text-muted-foreground md:text-base">
-              AIP BUS YOLO feature CSV를 Vercel 웹에서 업로드하면 EC2가
-              실시간 학습 스크립트를 돌리고, 웹은 진행 중인 예측 포인트를
-              계속 받아 그래프에 누적해서 보여줍니다.
-            </p>
-          </div>
-        </div>
-
-        <div className="grid min-w-0 gap-3 text-sm text-muted-foreground sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
-          <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
-            <div className="flex items-center gap-2 text-foreground">
-              <FileSpreadsheet className="size-4 text-primary" />
-              Feature CSV
-            </div>
-            <p className="mt-2 leading-6">
-              bus YOLO가 만든 `*_vehicle_counts.csv` 파일을 넣습니다.
-            </p>
-          </div>
-          <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
-            <div className="flex items-center gap-2 text-foreground">
-              <BarChart3 className="size-4 text-primary" />
-              실시간 그래프
-            </div>
-            <p className="mt-2 leading-6">
-              row가 처리될 때마다 예측 변화가 누적됩니다.
-            </p>
-          </div>
-          <div className="min-w-0 rounded-lg border border-border/80 bg-card/65 p-4 backdrop-blur-sm">
-            <div className="flex items-center gap-2 text-foreground">
-              <CloudCog className="size-4 text-primary" />
-              EC2 연결
-            </div>
-            <p className="mt-2 leading-6">
-              브라우저는 Next.js API를 통해서만 EC2와 통신합니다.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      <section className="grid min-w-0 flex-1 gap-5 py-6 xl:grid-cols-[320px_minmax(0,1fr)]">
+      <section className="grid min-w-0 flex-1 gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
         <Card className="min-w-0 border-border/80 bg-card/78 shadow-sm">
           <CardHeader className="space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1183,25 +1220,23 @@ export function RealtimeLearningWeb() {
                           strokeLinejoin="round"
                           strokeLinecap="round"
                         />
-                        {lineChart.markers.map((marker) => (
+                        {lineChart.markers
+                          .filter((marker) => marker.highlighted)
+                          .map((marker) => (
                           <circle
                             key={`${marker.index}-${marker.x}`}
                             cx={marker.x}
                             cy={marker.y}
-                            r={marker.highlighted ? 5.2 : 3.2}
+                            r={5.2}
                             tabIndex={0}
                             aria-label={`${marker.point.currentTimeLabel}, 예상 출발까지 ${formatSeconds(marker.point.expectedDepartureInSec)}`}
                             onMouseEnter={() => setHoveredPointIndex(marker.index)}
                             onFocus={() => setHoveredPointIndex(marker.index)}
                             onMouseLeave={() => setHoveredPointIndex(null)}
                             onBlur={() => setHoveredPointIndex(null)}
-                            className={
-                              marker.highlighted
-                                ? "cursor-pointer fill-sky-500 stroke-background stroke-[1.5]"
-                                : "cursor-pointer fill-primary/85"
-                            }
+                            className="cursor-pointer fill-sky-500 stroke-background stroke-[1.5]"
                           />
-                        ))}
+                          ))}
                       </svg>
 
                       <div className="relative mt-4 h-12">
@@ -1315,12 +1350,14 @@ export function RealtimeLearningWeb() {
                             strokeLinejoin="round"
                             strokeLinecap="round"
                           />
-                          {errorLineChart.markers.map((marker) => (
+                          {errorLineChart.markers
+                            .filter((marker) => marker.highlighted)
+                            .map((marker) => (
                             <circle
                               key={`error-${marker.index}-${marker.x}`}
                               cx={marker.x}
                               cy={marker.y}
-                              r={marker.highlighted ? 5.2 : 3.1}
+                              r={5.2}
                               className={
                                 marker.highlighted
                                   ? "fill-sky-500 stroke-background stroke-[1.5]"
@@ -1333,7 +1370,7 @@ export function RealtimeLearningWeb() {
                                 }`}
                               </title>
                             </circle>
-                          ))}
+                            ))}
                         </svg>
 
                         <div className="relative mt-4 h-12">
@@ -1462,12 +1499,14 @@ export function RealtimeLearningWeb() {
                                     strokeLinejoin="round"
                                     strokeLinecap="round"
                                   />
-                                  {group.chart.markers.map((marker) => (
+                                  {group.chart.markers
+                                    .filter((marker) => marker.highlighted)
+                                    .map((marker) => (
                                     <circle
                                       key={`${group.key}-${marker.index}-${marker.x}`}
                                       cx={marker.x}
                                       cy={marker.y}
-                                      r={marker.highlighted ? 5.2 : 3.1}
+                                      r={5.2}
                                       className={
                                         marker.highlighted
                                           ? "fill-sky-500 stroke-background stroke-[1.5]"
@@ -1480,7 +1519,7 @@ export function RealtimeLearningWeb() {
                                         }`}
                                       </title>
                                     </circle>
-                                  ))}
+                                    ))}
                                 </svg>
                               </div>
                               <div className="relative mt-4 h-12">
@@ -1519,46 +1558,98 @@ export function RealtimeLearningWeb() {
                 </div>
 
                 <div className="space-y-3">
-                  <div className="text-sm font-medium text-foreground">
-                    최종 버킷 스냅샷
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-medium text-foreground">
+                      실제 남은 시간대별 예측 오차
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      ROI out 이후 실제 남은 시간을 기준으로 묶은 평가입니다
+                    </div>
                   </div>
-                  {prediction.finalBuckets.length ? (
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                      {prediction.finalBuckets.map((bucket) => (
-                        <div
-                          key={bucket.label}
-                          className="rounded-lg border border-border/70 bg-background/70 p-4"
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div>
-                              <div className="font-medium text-foreground">{bucket.label}</div>
-                              <div className="text-xs text-muted-foreground">
-                                {bucket.etaStartLabel}
-                                {bucket.etaEndLabel ? ` - ${bucket.etaEndLabel}` : "+"}
+                  <div className="rounded-lg border border-border/70 bg-background/70 p-4">
+                    {evaluatedErrorPoints.length > 0 ? (
+                      <>
+                        <div className="flex h-72 items-end gap-3 overflow-x-auto pb-2">
+                          {actualErrorBucketSummaries.map((bucket) => {
+                            const barHeight =
+                              bucket.rows > 0
+                                ? Math.max(
+                                    8,
+                                    (bucket.meanAbsoluteError /
+                                      maxActualBucketMeanError) *
+                                      100,
+                                  )
+                                : 0;
+
+                            return (
+                              <div
+                                key={bucket.label}
+                                className="flex min-w-24 flex-1 flex-col justify-end gap-2"
+                              >
+                                <div className="text-center text-xs font-medium text-foreground">
+                                  {bucket.rows > 0
+                                    ? formatSeconds(bucket.meanAbsoluteError)
+                                    : "-"}
+                                </div>
+                                <div className="flex h-44 items-end rounded-md border border-border/50 bg-muted/25 px-3 py-2">
+                                  <div
+                                    className={
+                                      bucket.isBest
+                                        ? "w-full rounded-t-md bg-emerald-500"
+                                        : "w-full rounded-t-md bg-primary/85"
+                                    }
+                                    style={{ height: `${barHeight}%` }}
+                                    title={
+                                      bucket.rows > 0
+                                        ? `${bucket.label}: 평균 절대 오차 ${formatSeconds(bucket.meanAbsoluteError)}, 중앙값 ${formatSeconds(bucket.medianAbsoluteError)}`
+                                        : `${bucket.label}: 평가 row 없음`
+                                    }
+                                  />
+                                </div>
+                                <div className="space-y-1 text-center">
+                                  <div className="text-xs font-semibold text-foreground">
+                                    {bucket.label}
+                                  </div>
+                                  <div className="text-[11px] text-muted-foreground">
+                                    평가 {bucket.rows.toLocaleString()}개
+                                  </div>
+                                  {bucket.rows > 0 ? (
+                                    <div className="text-[11px] text-muted-foreground">
+                                      중앙 {formatSeconds(bucket.medianAbsoluteError)}
+                                    </div>
+                                  ) : (
+                                    <div className="text-[11px] text-muted-foreground">
+                                      평가 없음
+                                    </div>
+                                  )}
+                                  {bucket.isBest ? (
+                                    <div className="text-[11px] font-medium text-emerald-600">
+                                      가장 안정적
+                                    </div>
+                                  ) : null}
+                                </div>
                               </div>
-                            </div>
-                            <div className="text-sm font-medium text-foreground">
-                              {bucket.probabilityPercent}%
-                            </div>
-                          </div>
-                          <div className="mt-4 flex h-36 items-end justify-center rounded-md border border-border/50 bg-muted/25 p-2">
-                            <div
-                              className="w-12 rounded-t-md bg-primary/85 transition-[height]"
-                              style={{
-                                height: `${Math.max(bucket.probabilityPercent, 4)}%`,
-                              }}
-                            />
-                          </div>
-                          <Progress value={bucket.probabilityPercent} className="mt-3 h-2" />
+                            );
+                          })}
                         </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="rounded-lg border border-dashed border-border/70 bg-background/60 px-4 py-5 text-sm leading-6 text-muted-foreground">
-                      EC2 job이 끝나면 최종 버킷 확률이 표시됩니다. 그 전에도
-                      진행 중인 추세 그래프는 계속 업데이트됩니다.
-                    </div>
-                  )}
+                        <div className="mt-4 grid gap-3 border-t border-border/60 pt-4 text-xs text-muted-foreground sm:grid-cols-3">
+                          <div>
+                            평균 절대 오차는 각 시간대 row들의 오차 평균입니다.
+                          </div>
+                          <div>
+                            중앙값은 튀는 오차에 덜 흔들리는 보조 지표입니다.
+                          </div>
+                          <div>
+                            초록 막대는 현재 결과에서 평균 오차가 가장 낮은 구간입니다.
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-border/70 bg-muted/25 px-4 py-5 text-sm leading-6 text-muted-foreground">
+                        ROI 이벤트가 감지되면 실제 남은 시간대별 오차가 표시됩니다.
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 <Separator />
